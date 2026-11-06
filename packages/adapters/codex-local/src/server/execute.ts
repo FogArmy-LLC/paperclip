@@ -1238,7 +1238,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           "PATH", "HOME", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "TEMP", "TMP", "CODEX_HOME",
           // Keep Codex's default secret-name exclusions except for the scoped
           // Paperclip API token used by the agent skill. Never include host env.
-          ...Object.keys(env).filter(key => key === "PAPERCLIP_API_KEY" || !/key|secret|token/i.test(key)),
+          // The managed Git wrapper also needs its existing run-scoped capability.
+          // Do not expose provider or arbitrary service tokens to shell children.
+          ...Object.keys(env).filter(key =>
+            key === "PAPERCLIP_API_KEY" ||
+            key === "PAPERCLIP_GITHUB_BROKER_TOKEN" ||
+            !/key|secret|token/i.test(key)),
           ...identityNames,
         ])];
         args.unshift("-c", "features.shell_snapshot=false", "-c", 'shell_environment_policy.inherit="all"', "-c", "shell_environment_policy.ignore_default_excludes=true",
