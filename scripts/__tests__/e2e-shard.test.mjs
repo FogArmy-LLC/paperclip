@@ -30,8 +30,8 @@ function readTrustedPrWorkflow() {
   const caller = readFileSync(prCallerWorkflow, "utf8");
   assert.match(
     caller,
-    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master\s*$/m,
-    "pr.yml must call the trusted workflow from CODEOWNERS-protected master",
+    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@(?:master|[0-9a-f]{40})\s*$/m,
+    "pr.yml must call the trusted workflow from CODEOWNERS-protected master or pinned to an immutable commit for fork reproducibility",
   );
   // Validate proposed workflow changes locally; CI executes the merged master version.
   return readFileSync(trustedPrWorkflow, "utf8");
