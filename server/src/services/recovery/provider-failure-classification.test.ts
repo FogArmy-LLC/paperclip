@@ -5,6 +5,8 @@ import {
   PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS,
   classifyAdapterFailureForRecovery,
   classifyContinuationFailure,
+  isManagerCapabilityPrerequisiteExpired,
+  shouldReuseManagerCapabilityPrerequisite,
 } from "./service.js";
 import { legacyExecutionNeedsReconciliation } from "../legacy-execution-recovery.js";
 import { isConfigurationIncompleteFailedRun } from "../../modules/wake-queue/domain/values.js";
@@ -161,6 +163,61 @@ describe("classifyAdapterFailureForRecovery", () => {
       error,
       resultJson: null,
     })).toEqual({ kind: "configuration_incomplete" });
+  });
+
+  it.each([
+    ["GitHub API returned HTTP 401 while reading the repository", 401],
+    ["GitHub forbidden (403) while rerunning Actions", 403],
+  ] as const)("routes a GitHub capability denial to a manager prerequisite: %s", (error, status) => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "adapter_failed",
+      error,
+      resultJson: null,
+    })).toEqual({ kind: "capability_prerequisite", provider: "github", status });
+  });
+
+  it("does not spend a corrective attempt or refresh the deadline for an unchanged denial", () => {
+    expect(shouldReuseManagerCapabilityPrerequisite({
+      existing: {
+        cause: "configuration_incomplete",
+        fingerprint: "github-binding:rev-1",
+        ownerAgentId: "manager-1",
+        attemptCount: 1,
+      },
+      cause: "configuration_incomplete",
+      fingerprint: "github-binding:rev-1",
+      ownerAgentId: "manager-1",
+    })).toBe(true);
+  });
+
+  it.each([
+    ["binding revision changed", "github-binding:rev-2", "manager-1"],
+    ["manager changed", "github-binding:rev-1", "manager-2"],
+  ] as const)("counts a distinct corrective intervention after %s", (_label, fingerprint, ownerAgentId) => {
+    expect(shouldReuseManagerCapabilityPrerequisite({
+      existing: {
+        cause: "configuration_incomplete",
+        fingerprint: "github-binding:rev-1",
+        ownerAgentId: "manager-1",
+        attemptCount: 1,
+      },
+      cause: "configuration_incomplete",
+      fingerprint,
+      ownerAgentId,
+    })).toBe(false);
+  });
+
+  it("expires a missed manager capability deadline without charging an observation", () => {
+    const now = new Date("2026-11-08T12:00:00.000Z");
+    expect(isManagerCapabilityPrerequisiteExpired({
+      deadlineAt: "2026-11-08T11:59:59.999Z",
+      now,
+    })).toBe(true);
+    expect(isManagerCapabilityPrerequisiteExpired({
+      deadlineAt: "2026-11-08T12:00:00.001Z",
+      now,
+    })).toBe(false);
+    expect(isManagerCapabilityPrerequisiteExpired({ deadlineAt: "not-a-date", now })).toBe(false);
   });
 
   it("ignores quota-like text from non-adapter failures", () => {
