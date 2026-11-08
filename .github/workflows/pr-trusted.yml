@@ -305,6 +305,11 @@ jobs:
             pnpm install --frozen-lockfile
           fi
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
+
       # typecheck:build-gaps builds @paperclipai/server, whose build script
       # rebuilds the Runner release binary; without the shared Rust cache that
       # is a ~3m40s cold compile of all third-party crates (run 35036001734,
