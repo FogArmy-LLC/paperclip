@@ -13,4 +13,4 @@ jobs:
     # Master requires CODEOWNERS review for .github/**, including this workflow.
     # The AWS runner group permits pr-trusted.yml@refs/heads/master.
     # Pinned to release-compatible workflow: includes Rust toolchain for typecheck:rust
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@40ff0392826e3f06fde2d46f8d916d487838817d
+    uses: FogArmy-LLC/paperclip/.github/workflows/pr-trusted.yml@40ff0392826e3f06fde2d46f8d916d487838817d
