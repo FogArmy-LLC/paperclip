@@ -1277,6 +1277,15 @@ DevOps/SRE participant and recommendation in the same escalation receipt.
    matching evidence. `no` means no match in that search, not proof none exists;
    unavailable upstream access is `unknown`. Do not let this check delay an urgent
    safe repair or become a dependency on unrelated research.
+   DevOps/SRE also checks for related symptoms of the same systemic defect in
+   authorized live telemetry: disk/inode headroom and growth, backup freshness,
+   retention and restore coverage, queue age, retry/event amplification, orphaned
+   runs and affected tool paths. Compare upstream symptoms with observations;
+   record matches, disproven hypotheses and missing telemetry explicitly. Reuse
+   existing observability and incident lanes with a named response owner and
+   threshold; a dashboard or proposed monitor is not active observation. Do not
+   scan other tenants or create a new polling loop. Follow through on a detected
+   risk via the existing incident, without waiting for the original patch release.
 3. For **yes**, distinguish proposed, approved, merged, released and deployed.
    Verify the fix actually covers this fingerprint and the target maintenance
    version, including workflow/script compatibility, migrations and dependencies.
