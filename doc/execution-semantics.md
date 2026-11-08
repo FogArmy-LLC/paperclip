@@ -1254,6 +1254,62 @@ Create an issue-backed recovery action only when a separate issue is the right e
 
 ### Human Escalation
 
+#### FogArmy maintenance: known-issue check before escalation
+
+This is an operator procedure attached to the existing recovery action, not a
+new scheduler or an expansion of agent permissions. The source owner and manager
+retain the original incident, return owner, independent acceptance and retry budget.
+
+DevOps/SRE participates in the upstream path and release decision: verify deployed
+identity, assess patch/backport/roll-forward compatibility and operational risk,
+recommend the route, and prepare the release and rollback plan. Engineering owns
+the implementation and focused regressions; an independent reviewer owns
+acceptance. The authorized release owner retains any reserved deployment decision.
+Routine technical route selection uses existing delegated authority and does not
+create an additional CEO approval or pause independent coding. Record the named
+DevOps/SRE participant and recommendation in the same escalation receipt.
+
+1. Capture the failure fingerprint, exact operation/error, company/project/workspace/
+   repository binding, deployed server and runner versions, source SHA, effective
+   identity and last meaningful artifact. Separate observed evidence from hypotheses.
+2. Make one bounded check of official upstream documentation, issues, PRs and
+   release notes. Record `knownIssue: yes | no | unknown`, links, search time and
+   matching evidence. `no` means no match in that search, not proof none exists;
+   unavailable upstream access is `unknown`. Do not let this check delay an urgent
+   safe repair or become a dependency on unrelated research.
+3. For **yes**, distinguish proposed, approved, merged, released and deployed.
+   Verify the fix actually covers this fingerprint and the target maintenance
+   version, including workflow/script compatibility, migrations and dependencies.
+   Select the smallest supported route: apply a compatible reviewed patch; prepare
+   and start a scoped backport; or prepare a roll-forward to a released version
+   containing the fix. Downloading a patch is not applying or validating it.
+   An unmerged proposal is evidence to inspect, not an accepted fix. Record the
+   immutable patch/release identity, owner, next action, deadline and rollback.
+4. For **no/unknown**, start the smallest authorized local diagnosis/repair and
+   focused regression. Record the exact missing operation and capable resolver
+   when execution is unavailable. Do not repeat deterministic probes or wake an
+   incapable owner without a relevant configuration or execution-context change.
+5. Escalate the remaining protected operation, not routine technical choices.
+   Preserve reserved production, destructive, paid-provider and security-policy
+   decisions. Keep safe source work moving independently. When the governed
+   three-failed-recovery PagerDuty threshold applies, retain the same dedup key
+   and distinct attempt evidence; a known upstream fix does not reset that count.
+6. Close only after replay of the original failure, focused regression, fresh-run
+   affected-agent capability proof, independent exact-head acceptance and any
+   applicable authorized runtime verification. Hand execution back to the native
+   owner. Update the existing incident/configuration ledger with cause, applied
+   change, retained safeguards, before/after receipts, rollback, delivery impact,
+   release/version and fresh-agent inheritance. A queued run, green status or
+   written procedure alone is not acceptance or incident resolution.
+
+Escalation receipt fields: fingerprint; observed/hypothesis; scope and versions;
+knownIssue and upstream status/links; DevOps/SRE participant and recommendation;
+chosen patch/backport/roll-forward/local
+route; source/execution/manager/return/acceptance owners; attempt count and incident
+dedup key; next operation/deadline; retained gates; rollback; regression and
+delivery receipts. Reuse the existing recovery record instead of opening a
+duplicate controller, polling schedule or lesson ticket.
+
 Human escalation is required when the next safe action depends on board judgment, budget/approval policy, or information unavailable to the control plane.
 
 Examples:
