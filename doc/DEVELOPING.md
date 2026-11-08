@@ -28,6 +28,19 @@ GitHub Actions owns `pnpm-lock.yaml`.
 
 ## Trusted PR Workflow
 
+The FogArmy maintenance branch calls the canonical fork at immutable revision
+`8dd381f5ddb3501c55c715ab733f0717a12346e5`. Its `pr-trusted.yml` is identical
+to this source tree's workflow. Do not use a newer master workflow unless all
+of its commands exist in the maintenance checkout. The failed newer pin called
+absent runtime-build, boot-smoke, test-typecheck, and Docker test scripts.
+Before changing this pin, compare the called workflow with this tree, check
+every command and nested workflow reference, and run the full required matrix.
+Keep the read-only token permissions, independent review, and protected merge.
+The fork uses the GitHub-hosted fallback; this repair grants no AWS runner access.
+Rollback restores the prior caller pin; retain failed-run evidence.
+
+For the upstream master deployment:
+
 The PR caller uses `paperclipai/paperclip/.github/workflows/pr-trusted.yml@master`.
 The AWS runner group `paperclip-public-pr` must allow
 `paperclipai/paperclip/.github/workflows/pr-trusted.yml@refs/heads/master`.

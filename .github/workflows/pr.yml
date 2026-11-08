@@ -12,5 +12,6 @@ jobs:
   ci:
     # Master requires CODEOWNERS review for .github/**, including this workflow.
     # The AWS runner group permits pr-trusted.yml@refs/heads/master.
-    # Pinned to release-compatible workflow: includes Rust toolchain for typecheck:rust
-    uses: FogArmy-LLC/paperclip/.github/workflows/pr-trusted.yml@40ff0392826e3f06fde2d46f8d916d487838817d
+    # Use this maintenance tree's workflow, including its pinned Rust toolchain.
+    # Newer master workflows require scripts absent from this release branch.
+    uses: FogArmy-LLC/paperclip/.github/workflows/pr-trusted.yml@8dd381f5ddb3501c55c715ab733f0717a12346e5
