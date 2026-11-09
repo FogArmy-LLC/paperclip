@@ -4,9 +4,8 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened]
 
-# Always runs from base branch context — never executes PR code.
-# Use the repository-scoped ephemeral Actions identity; no App private key is needed.
-
+# Execute only independently reviewed, immutable trusted gate scripts.
+# Repository-scoped ephemeral Actions identity; no App private key.
 permissions:
   pull-requests: write
   checks: write
@@ -17,10 +16,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Checkout base branch (never PR code)
+      - name: Checkout reviewed trusted gate scripts (never PR code)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: master
+          ref: bf0e7628e3d635426bf328493b77fefbb918745b
 
       - name: Dependency Review
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
