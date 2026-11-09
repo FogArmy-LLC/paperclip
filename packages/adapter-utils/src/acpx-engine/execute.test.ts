@@ -563,18 +563,31 @@ describe("shared ACPX engine runtime behavior", () => {
     );
   });
 
-  it("keeps identity and scoped API access without exposing configured service tokens to Codex shells", async () => {
-    const { meta } = await runExecutor({ agent: "codex", env: { MY_SERVICE_TOKEN: "assigned-tool-token" } }, {
+  it("keeps identity and scoped API and Git broker access without exposing other tokens to Codex shells", async () => {
+    const { meta } = await runExecutor({ agent: "codex", env: {
+      MY_SERVICE_TOKEN: "assigned-tool-token",
+      PAPERCLIP_GITHUB_BROKER_URL: "http://127.0.0.1:3100/api/github-broker",
+      PAPERCLIP_GITHUB_BROKER_TOKEN: "synthetic-run-broker-token",
+      PAPERCLIP_GITHUB_BRIDGE_TOKEN: "synthetic-bridge-token",
+      OPENAI_API_KEY: "synthetic-provider-key",
+      GH_TOKEN: "synthetic-github-token",
+    } }, {
       authToken: "assigned-run-token",
       agentIdentity: { keyId: "sha256:test", publicKeyPem: "public", privateKeyPem: "private" },
     });
     const config = JSON.parse(String((meta[0]?.env as Record<string, string>).CODEX_CONFIG));
     expect(config.shell_environment_policy.include_only).toEqual(expect.arrayContaining([
       "PAPERCLIP_API_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY",
+      "PAPERCLIP_GITHUB_BROKER_URL", "PAPERCLIP_GITHUB_BROKER_TOKEN",
     ]));
     expect(config.shell_environment_policy.include_only).not.toContain("MY_SERVICE_TOKEN");
+    expect(config.shell_environment_policy.include_only).not.toContain("PAPERCLIP_GITHUB_BRIDGE_TOKEN");
+    expect(config.shell_environment_policy.include_only).not.toContain("OPENAI_API_KEY");
+    expect(config.shell_environment_policy.include_only).not.toContain("GH_TOKEN");
     expect(JSON.stringify(config)).not.toContain("assigned-run-token");
     expect(JSON.stringify(config)).not.toContain("assigned-tool-token");
+    expect(JSON.stringify(config)).not.toContain("synthetic-run-broker-token");
+    expect(JSON.stringify(config)).not.toContain("synthetic-provider-key");
   });
 
   it("forwards arbitrary Codex model IDs verbatim without picker-dependent session config", async () => {

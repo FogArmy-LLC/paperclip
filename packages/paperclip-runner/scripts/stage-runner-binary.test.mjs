@@ -34,7 +34,9 @@ async function withOwnedChildren(root, action) {
 
 test("atomically publishes while the previous executable is running", { skip: process.platform === "win32", timeout: 15_000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), "runnerd-stage-test-"));
-  const destination = path.join(root, "paperclip-runnerd");
+  // Ubuntu's multicall coreutils dispatches by the executable's filename.
+  // Preserve sleep's name so this fixture tests publication, not dispatch.
+  const destination = path.join(root, "sleep");
   await withOwnedChildren(root, async start => {
     await stageRunnerBinary("/bin/sleep", destination);
     const previous = await stat(destination);
@@ -46,7 +48,7 @@ test("atomically publishes while the previous executable is running", { skip: pr
     assert.equal(published.mode & 0o777, 0o755);
     assert.equal(old.child.exitCode, null);
     assert.equal(old.child.signalCode, null);
-    assert.deepEqual(await readdir(root), ["paperclip-runnerd"]);
+    assert.deepEqual(await readdir(root), ["sleep"]);
     const next = start(destination, ["0"]);
     await next.spawned; await next.closed;
     assert.equal(next.child.exitCode, 0);

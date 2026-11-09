@@ -20,6 +20,7 @@ import { checkReleaseBootstrap } from './check-pr-release-bootstrap.mjs';
 import { checkCoauthors, fetchAllPullRequestCommits } from './check-pr-coauthors.mjs';
 
 const COMMENT_SIGNATURE = '— commitperclip';
+const RECOGNIZED_GATE_BOTS = ['commitperclip[bot]', 'commitperclip', 'github-actions[bot]'];
 
 function buildComment(author, failures, informational) {
   if (failures.length === 0 && informational.length === 0) {
@@ -49,15 +50,17 @@ function buildComment(author, failures, informational) {
   return lines.join('\n');
 }
 
-export async function findExistingComment(fetchFromGitHub, token, repo, prNumber) {
+export async function findExistingComment(fetchFromGitHub, token, repo, prNumber, currentUser = 'commitperclip[bot]') {
+  if (!RECOGNIZED_GATE_BOTS.includes(currentUser)) throw new Error('Explicit recognized comment author required');
   for (let page = 1; ; page += 1) {
     const comments = await fetchFromGitHub(
       `/repos/${repo}/issues/${prNumber}/comments?per_page=100&page=${page}`,
       token
     );
 
+    // Filter by current identity: only return comments we can actually update
     const existing = comments.find(
-      c => (c.user.login === 'commitperclip[bot]' || c.user.login === 'commitperclip') &&
+      c => c.user.login === currentUser &&
            c.body.includes(COMMENT_SIGNATURE)
     );
     if (existing) return existing;
@@ -66,15 +69,16 @@ export async function findExistingComment(fetchFromGitHub, token, repo, prNumber
   }
 }
 
-async function upsertComment(token, repo, prNumber, body, existing) {
+export async function upsertComment(token, repo, prNumber, body, existing, fetchFromGitHub = ghFetch) {
+  // findExistingComment() already filtered by current identity, so existing is ours to update.
   if (existing) {
-    await ghFetch(`/repos/${repo}/issues/comments/${existing.id}`, token, {
+    await fetchFromGitHub(`/repos/${repo}/issues/comments/${existing.id}`, token, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ body }),
     });
   } else {
-    await ghFetch(`/repos/${repo}/issues/${prNumber}/comments`, token, {
+    await fetchFromGitHub(`/repos/${repo}/issues/${prNumber}/comments`, token, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ body }),
@@ -83,7 +87,7 @@ async function upsertComment(token, repo, prNumber, body, existing) {
 }
 
 async function main() {
-  const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH } = process.env;
+  const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH, GH_COMMENT_AUTHOR } = process.env;
 
   if (!GH_TOKEN || !GH_REPO || !PR_NUMBER) {
     console.error('ERROR: GH_TOKEN, GH_REPO, PR_NUMBER env vars required');
@@ -99,6 +103,11 @@ async function main() {
   if (!/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(GH_REPO)) {
     console.error('ERROR: GH_REPO must be in owner/repo format');
     process.exit(1);
+  }
+
+  // Supplied by the trusted workflow, never PR content or an unsupported /user lookup.
+  if (!RECOGNIZED_GATE_BOTS.includes(GH_COMMENT_AUTHOR)) {
+    throw new Error('GH_COMMENT_AUTHOR must name the trusted posting bot');
   }
 
   // Fetch PR data once — gates use this, no redundant API calls
@@ -153,7 +162,8 @@ async function main() {
   const commentBody = buildComment(author, allFailures, informational);
 
   // Post comment if there are failures/informational, or update existing comment
-  const existing = await findExistingComment(ghFetch, GH_TOKEN, GH_REPO, prNumber);
+  // Legacy comments remain untouched; find our own signed comment across all pages.
+  const existing = await findExistingComment(ghFetch, GH_TOKEN, GH_REPO, prNumber, GH_COMMENT_AUTHOR);
   if (allFailures.length > 0 || informational.length > 0 || existing) {
     await upsertComment(GH_TOKEN, GH_REPO, prNumber, commentBody, existing);
   }

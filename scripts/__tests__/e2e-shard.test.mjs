@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -25,15 +26,21 @@ function runShard(args) {
   return result.stdout.trim().split(/\s+/).filter(Boolean);
 }
 
-function readTrustedPrWorkflow() {
-  const caller = readFileSync(prCallerWorkflow, "utf8");
+function validateMaintenanceWorkflow(caller, workflow) {
   assert.match(
     caller,
-    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master\s*$/m,
-    "pr.yml must call the trusted workflow from CODEOWNERS-protected master",
+    /^\s+uses: FogArmy-LLC\/paperclip\/\.github\/workflows\/pr-trusted\.yml@8dd381f5ddb3501c55c715ab733f0717a12346e5\s*$/m,
+    "maintenance CI must call the canonical fork at its qualified immutable revision",
   );
-  // Validate proposed workflow changes locally; CI executes the merged master version.
-  return readFileSync(trustedPrWorkflow, "utf8");
+  // The pinned revision contains these exact workflow bytes. A new harness
+  // needs a new qualified pin, not silent drift or an unrelated master tree.
+  assert.equal(createHash("sha256").update(workflow).digest("hex"),
+    "ca7d50bc33852a4f3dd3fbd4fa4894d5b13cb160a640638d167f213bf675dab7");
+  return workflow;
+}
+
+function readTrustedPrWorkflow() {
+  return validateMaintenanceWorkflow(readFileSync(prCallerWorkflow, "utf8"), readFileSync(trustedPrWorkflow, "utf8"));
 }
 
 function readWorkflowJobs(workflow) {
@@ -157,8 +164,16 @@ test("shard arguments are validated", () => {
   }
 });
 
-test("pr.yml calls the trusted PR workflow from master", () => {
+test("pr.yml calls the maintenance-compatible immutable workflow in the canonical fork", () => {
   assert.ok(readTrustedPrWorkflow().length > 0);
+});
+
+test("maintenance qualification rejects a different repository, moving ref, or changed harness", () => {
+  const caller = readFileSync(prCallerWorkflow, "utf8");
+  const workflow = readTrustedPrWorkflow();
+  assert.throws(() => validateMaintenanceWorkflow(caller.replace("FogArmy-LLC/paperclip/", "paperclipai/paperclip/"), workflow));
+  assert.throws(() => validateMaintenanceWorkflow(caller.replace("@8dd381f5ddb3501c55c715ab733f0717a12346e5", "@master"), workflow));
+  assert.throws(() => validateMaintenanceWorkflow(caller, `${workflow}\n# unqualified change\n`));
 });
 
 test("the trusted PR workflow keeps a stable aggregate check named e2e over the shard matrix", () => {
