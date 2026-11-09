@@ -50,15 +50,16 @@ function buildComment(author, failures, informational) {
   return lines.join('\n');
 }
 
-export async function findExistingComment(fetchFromGitHub, token, repo, prNumber) {
+export async function findExistingComment(fetchFromGitHub, token, repo, prNumber, currentUser) {
   for (let page = 1; ; page += 1) {
     const comments = await fetchFromGitHub(
       `/repos/${repo}/issues/${prNumber}/comments?per_page=100&page=${page}`,
       token
     );
 
+    // Filter by current identity: only return comments we can actually update
     const existing = comments.find(
-      c => RECOGNIZED_GATE_BOTS.includes(c.user.login) &&
+      c => c.user.login === currentUser &&
            c.body.includes(COMMENT_SIGNATURE)
     );
     if (existing) return existing;
@@ -77,26 +78,13 @@ async function getCurrentUser(token) {
 }
 
 async function upsertComment(token, repo, prNumber, body, existing) {
-  // For safe identity migration: only PATCH if comment author matches current identity.
-  // If identities differ, create a new comment instead (legacy comment stays untouched).
+  // findExistingComment() already filtered by current identity, so existing is ours to update.
   if (existing) {
-    const currentUser = await getCurrentUser(token);
-    const canUpdate = currentUser && existing.user.login === currentUser;
-
-    if (canUpdate) {
-      await ghFetch(`/repos/${repo}/issues/comments/${existing.id}`, token, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ body }),
-      });
-    } else {
-      // Identity mismatch: create new comment, preserve legacy comment
-      await ghFetch(`/repos/${repo}/issues/${prNumber}/comments`, token, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ body }),
-      });
-    }
+    await ghFetch(`/repos/${repo}/issues/comments/${existing.id}`, token, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ body }),
+    });
   } else {
     await ghFetch(`/repos/${repo}/issues/${prNumber}/comments`, token, {
       method: 'POST',
@@ -124,6 +112,9 @@ async function main() {
     console.error('ERROR: GH_REPO must be in owner/repo format');
     process.exit(1);
   }
+
+  // Get current user identity for comment lookup (optional: if GET /user fails, we'll still create comments)
+  const currentUser = await getCurrentUser(GH_TOKEN);
 
   // Fetch PR data once — gates use this, no redundant API calls
   const [pr, files] = await Promise.all([
@@ -177,7 +168,8 @@ async function main() {
   const commentBody = buildComment(author, allFailures, informational);
 
   // Post comment if there are failures/informational, or update existing comment
-  const existing = await findExistingComment(ghFetch, GH_TOKEN, GH_REPO, prNumber);
+  // Only look for comments from the current user (if we could determine it)
+  const existing = currentUser ? await findExistingComment(ghFetch, GH_TOKEN, GH_REPO, prNumber, currentUser) : null;
   if (allFailures.length > 0 || informational.length > 0 || existing) {
     await upsertComment(GH_TOKEN, GH_REPO, prNumber, commentBody, existing);
   }
