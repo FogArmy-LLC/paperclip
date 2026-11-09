@@ -20,6 +20,7 @@ import { checkReleaseBootstrap } from './check-pr-release-bootstrap.mjs';
 import { checkCoauthors, fetchAllPullRequestCommits } from './check-pr-coauthors.mjs';
 
 const COMMENT_SIGNATURE = '— commitperclip';
+const RECOGNIZED_GATE_BOTS = ['commitperclip[bot]', 'commitperclip', 'github-actions[bot]'];
 
 function buildComment(author, failures, informational) {
   if (failures.length === 0 && informational.length === 0) {
@@ -57,7 +58,7 @@ export async function findExistingComment(fetchFromGitHub, token, repo, prNumber
     );
 
     const existing = comments.find(
-      c => (c.user.login === 'commitperclip[bot]' || c.user.login === 'commitperclip') &&
+      c => RECOGNIZED_GATE_BOTS.includes(c.user.login) &&
            c.body.includes(COMMENT_SIGNATURE)
     );
     if (existing) return existing;
@@ -66,13 +67,36 @@ export async function findExistingComment(fetchFromGitHub, token, repo, prNumber
   }
 }
 
+async function getCurrentUser(token) {
+  try {
+    const user = await ghFetch('/user', token);
+    return user?.login;
+  } catch {
+    return null;
+  }
+}
+
 async function upsertComment(token, repo, prNumber, body, existing) {
+  // For safe identity migration: only PATCH if comment author matches current identity.
+  // If identities differ, create a new comment instead (legacy comment stays untouched).
   if (existing) {
-    await ghFetch(`/repos/${repo}/issues/comments/${existing.id}`, token, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ body }),
-    });
+    const currentUser = await getCurrentUser(token);
+    const canUpdate = currentUser && existing.user.login === currentUser;
+
+    if (canUpdate) {
+      await ghFetch(`/repos/${repo}/issues/comments/${existing.id}`, token, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ body }),
+      });
+    } else {
+      // Identity mismatch: create new comment, preserve legacy comment
+      await ghFetch(`/repos/${repo}/issues/${prNumber}/comments`, token, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ body }),
+      });
+    }
   } else {
     await ghFetch(`/repos/${repo}/issues/${prNumber}/comments`, token, {
       method: 'POST',
