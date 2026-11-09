@@ -50,7 +50,8 @@ function buildComment(author, failures, informational) {
   return lines.join('\n');
 }
 
-export async function findExistingComment(fetchFromGitHub, token, repo, prNumber, currentUser) {
+export async function findExistingComment(fetchFromGitHub, token, repo, prNumber, currentUser = 'commitperclip[bot]') {
+  if (!RECOGNIZED_GATE_BOTS.includes(currentUser)) throw new Error('Explicit recognized comment author required');
   for (let page = 1; ; page += 1) {
     const comments = await fetchFromGitHub(
       `/repos/${repo}/issues/${prNumber}/comments?per_page=100&page=${page}`,
@@ -68,25 +69,16 @@ export async function findExistingComment(fetchFromGitHub, token, repo, prNumber
   }
 }
 
-async function getCurrentUser(token) {
-  try {
-    const user = await ghFetch('/user', token);
-    return user?.login;
-  } catch {
-    return null;
-  }
-}
-
-async function upsertComment(token, repo, prNumber, body, existing) {
+export async function upsertComment(token, repo, prNumber, body, existing, fetchFromGitHub = ghFetch) {
   // findExistingComment() already filtered by current identity, so existing is ours to update.
   if (existing) {
-    await ghFetch(`/repos/${repo}/issues/comments/${existing.id}`, token, {
+    await fetchFromGitHub(`/repos/${repo}/issues/comments/${existing.id}`, token, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ body }),
     });
   } else {
-    await ghFetch(`/repos/${repo}/issues/${prNumber}/comments`, token, {
+    await fetchFromGitHub(`/repos/${repo}/issues/${prNumber}/comments`, token, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ body }),
@@ -95,7 +87,7 @@ async function upsertComment(token, repo, prNumber, body, existing) {
 }
 
 async function main() {
-  const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH } = process.env;
+  const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH, GH_COMMENT_AUTHOR } = process.env;
 
   if (!GH_TOKEN || !GH_REPO || !PR_NUMBER) {
     console.error('ERROR: GH_TOKEN, GH_REPO, PR_NUMBER env vars required');
@@ -113,8 +105,10 @@ async function main() {
     process.exit(1);
   }
 
-  // Get current user identity for comment lookup (optional: if GET /user fails, we'll still create comments)
-  const currentUser = await getCurrentUser(GH_TOKEN);
+  // Supplied by the trusted workflow, never PR content or an unsupported /user lookup.
+  if (!RECOGNIZED_GATE_BOTS.includes(GH_COMMENT_AUTHOR)) {
+    throw new Error('GH_COMMENT_AUTHOR must name the trusted posting bot');
+  }
 
   // Fetch PR data once — gates use this, no redundant API calls
   const [pr, files] = await Promise.all([
@@ -168,8 +162,8 @@ async function main() {
   const commentBody = buildComment(author, allFailures, informational);
 
   // Post comment if there are failures/informational, or update existing comment
-  // Only look for comments from the current user (if we could determine it)
-  const existing = currentUser ? await findExistingComment(ghFetch, GH_TOKEN, GH_REPO, prNumber, currentUser) : null;
+  // Legacy comments remain untouched; find our own signed comment across all pages.
+  const existing = await findExistingComment(ghFetch, GH_TOKEN, GH_REPO, prNumber, GH_COMMENT_AUTHOR);
   if (allFailures.length > 0 || informational.length > 0 || existing) {
     await upsertComment(GH_TOKEN, GH_REPO, prNumber, commentBody, existing);
   }
