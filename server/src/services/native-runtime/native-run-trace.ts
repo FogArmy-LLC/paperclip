@@ -193,7 +193,7 @@ function safeAttributes(
 }
 
 /**
- * Run-scoped tracing for the native Paperclip runner path.
+ * Run-scoped tracing for server-owned execution paths.
  *
  * A scope owns a real OpenTelemetry parent context. While work runs inside a
  * scope, nested native measurements and the existing sandbox/provider tracing
@@ -204,6 +204,7 @@ export function createNativeRunTrace(input: {
   /** Trusted run binding from heartbeat/native execution, never span attributes. */
   companyId: string;
   runId: string;
+  runtime?: "paperclip_runner" | "direct_adapter";
   startedAtMs?: number;
   onEvent?: NativeRunTraceSink;
   traceContext?: StartupTraceContextHandle;
@@ -225,7 +226,7 @@ export function createNativeRunTrace(input: {
       startTime: traceStartedAtMs,
       attributes: {
         ...traceIdentityAttributes,
-        "paperclip.task.run.runtime": "paperclip_runner",
+        "paperclip.task.run.runtime": input.runtime ?? "paperclip_runner",
         "paperclip.task.run.trace_schema_version":
           NATIVE_RUN_TRACE_SCHEMA_VERSION,
       },
@@ -525,7 +526,7 @@ export function createNativeRunTrace(input: {
       startedAtMs: traceStartedAtMs,
       endedAtMs,
       outcome,
-      attributes: { runtime: "paperclip_runner" },
+      attributes: { runtime: input.runtime ?? "paperclip_runner" },
     });
   };
 

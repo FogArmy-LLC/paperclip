@@ -1,10 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issues, nativeRunFinalizations, runUsageReceipts, workspaceOperations, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { getActiveStepContext } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import * as legacyRecovery from "../legacy-execution-recovery.js";
 import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
@@ -22,6 +23,7 @@ import { createHeartbeatRunState } from "./run-state.js";
 import { buildEffectiveRunSessionConfigMetadata } from "./workspaces.js";
 import { revokeHeartbeatRunGatewayTokens } from "./run-preparation.js";
 import { executeHeartbeatRuntime, type HeartbeatRuntimeExecutionInput } from "./runtime-execution.js";
+import type { StartupTraceContextHandle } from "../../instrumentation.js";
 
 // Keep real accounting, workspace barriers, and task-session persistence. Providers
 // and gateway delivery are external boundaries; browser acceptance covers their wiring.
@@ -56,9 +58,9 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     vi.mocked(executePaperclipNativeSession).mockResolvedValue({ exitCode: 0, signal: null, timedOut: false });
   });
 
-  async function fixture(native = false) {
+  async function fixture(native = false, adapterType?: string) {
     const [company] = await db.insert(companies).values({ name: "Runtime execution", issuePrefix: "EXE" }).returning();
-    const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Executing agent", status: "running", adapterType: native ? "paperclip_runner" : "process", adapterConfig: { provider: "codex" } }).returning();
+    const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Executing agent", status: "running", adapterType: adapterType ?? (native ? "paperclip_runner" : "process"), adapterConfig: { provider: "codex" } }).returning();
     const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Complete this task", assigneeAgentId: agent.id }).returning();
     const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, issueId: issue.id, scopeKind: "issue", status: "running", runtimeMode: native ? "native" : "legacy" }).returning();
     const state = createHeartbeatRunState(db);
@@ -113,6 +115,28 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(input.instructions.releaseInstructionCopy).toHaveBeenCalledOnce();
   }
 
+  function recordingTraceContext() {
+    const spans: Array<{ name: string; attributes: Record<string, unknown>; ended: boolean }> = [];
+    const records = new WeakMap<object, (typeof spans)[number]>();
+    const traceContext: StartupTraceContextHandle = {
+      tracer: {
+        startSpan(name, options) {
+          const spanRecord = { name, attributes: (options as { attributes?: Record<string, unknown> } | undefined)?.attributes ?? {}, ended: false };
+          spans.push(spanRecord);
+          const span = {
+            setAttribute(key: string, value: unknown) { spanRecord.attributes[key] = value; },
+            setStatus() {},
+            end() { spanRecord.ended = true; },
+          };
+          records.set(span, spanRecord);
+          return span;
+        },
+      },
+      contextWithSpan(span) { return { span: typeof span === "object" && span !== null ? records.get(span) : undefined }; },
+    };
+    return { traceContext, spans };
+  }
+
   it.each([false, true])("preserves the dispatch gate's early return and cleanup (native: %s)", async native => {
     const { input, adapter } = await fixture(native);
     input.control.dispatchResolvedInteractionContinuationWithAtomicGate = async () => ({ dispatched: false });
@@ -123,6 +147,35 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(input.effects.onLegacyAdapterEntered).not.toHaveBeenCalled();
     expect(await finalizations()).toHaveLength(0);
     expectCleanup(input);
+  });
+
+  it("binds the codex_local direct-adapter execution to its trusted company and hashed run trace", async () => {
+    const { input, adapter, run } = await fixture(false, "codex_local");
+    const { traceContext, spans } = recordingTraceContext();
+    input.trace.traceContext = traceContext;
+    adapter.execute.mockImplementationOnce(async () => {
+      const active = getActiveStepContext()?.parentContext as { span?: { name?: string } } | undefined;
+      expect(active?.span?.name).toBe("adapter.execute");
+      return { exitCode: 0, signal: null, timedOut: false };
+    });
+
+    await executeHeartbeatRuntime(db, input);
+
+    const expectedRunHash = createHash("sha256").update(run.id).digest("hex").slice(0, 12);
+    const root = spans.find(span => span.name === "task.run");
+    const child = spans.find(span => span.name === "adapter.execute");
+    expect(root?.attributes).toMatchObject({
+      "paperclip.task.run.company_id": input.agent.companyId,
+      "paperclip.task.run.run_id": expectedRunHash,
+      "paperclip.task.run.runtime": "direct_adapter",
+    });
+    expect(child?.attributes).toMatchObject({
+      "paperclip.task.run.company_id": input.agent.companyId,
+      "paperclip.task.run.run_id": expectedRunHash,
+    });
+    expect(JSON.stringify(spans)).not.toContain(run.id);
+    expect(root?.ended).toBe(true);
+    expect(child?.ended).toBe(true);
   });
 
   it("captures usage and live instruction saves before finalizing a legacy workspace", async () => {
