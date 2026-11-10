@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   issues,
   issueComments,
@@ -1923,7 +1924,12 @@ export function createHeartbeatScheduling(
     for (const batch of batches.values()) {
       const idempotencyWindow = Math.floor(now.getTime() / (5 * 60 * 1000));
       const issueIds = batch.issues.map((issue) => issue.id).sort();
-      const idempotencyKey = `execution-sla:${batch.companyId}:${batch.manager.id}:${batch.stage}:${idempotencyWindow}:${issueIds.join(",")}`;
+      // This key is B-tree indexed. A UUID list grows beyond PostgreSQL's
+      // index-entry limit as overdue work accumulates, rejecting the whole wake.
+      // Retain the complete sorted membership in the payload, with a bounded
+      // digest in the key. Company, manager, stage and window remain explicit.
+      const membershipHash = createHash("sha256").update(issueIds.join(",")).digest("hex");
+      const idempotencyKey = `execution-sla:${batch.companyId}:${batch.manager.id}:${batch.stage}:${idempotencyWindow}:${membershipHash}`;
       const wakeReason = `critical_execution_sla_${batch.stage}`;
       let wake: Awaited<ReturnType<typeof enqueueWakeup>> | null = null;
       let dispatchError: string | null = null;
