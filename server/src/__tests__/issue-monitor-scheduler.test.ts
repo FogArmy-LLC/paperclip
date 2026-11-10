@@ -340,10 +340,10 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(warningWake[0]?.payload).toMatchObject({ issueIds: [issueId] });
     await waitForHeartbeatIdle();
     await db.update(agentWakeupRequests).set({
-      status: "failed",
-      error: "Injected missed warning handoff",
+      status: "queued",
+      error: null,
       requestedAt: new Date("2026-04-11T12:30:00.000Z"),
-      finishedAt: new Date("2026-04-11T12:30:01.000Z"),
+      finishedAt: null,
     }).where(eq(agentWakeupRequests.id, warningWake[0]!.id));
 
     // Repeating the scheduler tick cannot duplicate the warning or reset the clock.
@@ -370,13 +370,16 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await heartbeat.tickTimers(new Date("2026-04-11T12:45:00.000Z"));
     const dispatched = await db.select().from(agentWakeupRequests)
       .where(sql`${agentWakeupRequests.companyId} = ${companyId} and ${agentWakeupRequests.reason} like 'critical_execution_sla_%'`);
-    expect(dispatched.map(row => row.reason)).toEqual([
-      "critical_execution_sla_warning",
+    const dispatchedByStage = [...dispatched].sort((a, b) => a.reason.localeCompare(b.reason));
+    expect(dispatchedByStage.map(row => row.reason)).toEqual([
       "critical_execution_sla_breach",
+      "critical_execution_sla_warning",
     ]);
-    expect(dispatched[0]?.agentId).toBe(managerId);
-    expect(dispatched[1]?.agentId).toBe(alternateManagerId);
-    expect(dispatched[1]?.payload).toMatchObject({ issueIds: [issueId] });
+    const warningDispatch = dispatchedByStage.find(row => row.reason === "critical_execution_sla_warning");
+    const breachDispatch = dispatchedByStage.find(row => row.reason === "critical_execution_sla_breach");
+    expect(warningDispatch?.agentId).toBe(managerId);
+    expect(breachDispatch?.agentId).toBe(alternateManagerId);
+    expect(breachDispatch?.payload).toMatchObject({ issueIds: [issueId] });
     expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.id, activeRunId), eq(heartbeatRuns.status, "running")))).toHaveLength(1);
     const [stillOwned] = await db.select().from(issues).where(eq(issues.id, issueId));
@@ -387,6 +390,19 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     const [breachReceipt] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(breachReceipt.executionSlaBreachAt).toBeNull();
     expect(breachReceipt.assigneeAgentId).toBe(agentId);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, activeRunId));
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, issueId));
+
+    const slaActivities = await db.select().from(activityLog)
+      .where(sql`${activityLog.entityId} = ${issueId} and ${activityLog.action} like 'issue.execution_sla_%_wake_queued'`);
+    expect(slaActivities.map(row => row.action).sort()).toEqual([
+      "issue.execution_sla_breach_wake_queued",
+      "issue.execution_sla_warning_wake_queued",
+    ]);
+    expect(slaActivities.every(row => row.details && typeof row.details === "object" &&
+      (row.details as Record<string, unknown>).recipientAcknowledged === false &&
+      (row.details as Record<string, unknown>).correctiveWorkStarted === false &&
+      (row.details as Record<string, unknown>).correctiveOutcomeAccepted === false)).toBe(true);
   });
 
   it("keeps execution SLA opt-in and excludes terminal or cross-company issues", async () => {

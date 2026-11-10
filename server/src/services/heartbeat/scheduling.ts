@@ -1569,13 +1569,13 @@ export function createHeartbeatScheduling(
       const wake = await db.select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status }).from(agentWakeupRequests)
         .where(and(eq(agentWakeupRequests.companyId, pending.companyId), eq(agentWakeupRequests.idempotencyKey, idempotencyKey)))
         .limit(1).then((rows) => rows[0] ?? null);
-      const accepted = Boolean(wake && !["failed", "cancelled", "skipped"].includes(wake.status));
+      const wakeQueued = Boolean(wake && !["failed", "cancelled", "skipped"].includes(wake.status));
       await db.update(issueRecoveryActions).set({
         evidence: {
           ...pending.evidence,
           executionSlaDispatch: {
             ...dispatch,
-            status: accepted ? "queued" : "pending",
+            status: wakeQueued ? "queued" : "pending",
             attemptCount: (typeof dispatch.attemptCount === "number" ? dispatch.attemptCount : 0) + 1,
             lastAttemptAt: now.toISOString(),
             wakeRequestId: wake?.id ?? null,
@@ -1590,7 +1590,7 @@ export function createHeartbeatScheduling(
         inArray(issueRecoveryActions.status, ["active", "escalated"]),
       ));
       retriedTakeoverIssueIds.add(pending.sourceIssueId);
-      if (accepted) enqueued += 1;
+      if (wakeQueued) enqueued += 1;
     }
 
     let skipped = 0;
@@ -1628,8 +1628,9 @@ export function createHeartbeatScheduling(
         ?? [...agentById.values()].find((agent) => agent.companyId === issue.companyId && !agent.reportsTo)?.id
         ?? null;
       if (stageKey === "breach" && issue.executionSlaWarningAt && directManagerId) {
-        // A warning already accepted by the first manager but not acted on by
-        // the 45-minute point advances one level in the same reporting chain.
+        // A durable warning wake was queued for the direct manager. This is
+        // not a recipient ACK or evidence of work; the immutable clock still
+        // breaches at 45 minutes, so route the breach one level higher.
         // If no higher manager is configured, retain the direct manager as the
         // executable resolver rather than dropping the open breach.
         stageFirstManagerId = agentById.get(directManagerId)?.reportsTo ?? directManagerId;
@@ -1849,12 +1850,12 @@ export function createHeartbeatScheduling(
               .where(and(eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.idempotencyKey, idempotencyKey)))
               .limit(1)
               .then((rows) => rows[0] ?? null);
-            const transferWakeAccepted = Boolean(durableTransferWake && !["failed", "cancelled", "skipped"].includes(durableTransferWake.status));
+            const transferWakeQueued = Boolean(durableTransferWake && !["failed", "cancelled", "skipped"].includes(durableTransferWake.status));
             await db.update(issueRecoveryActions).set({
               evidence: {
                 ...transferred.evidence,
                 executionSlaDispatch: {
-                  status: transferWakeAccepted ? "queued" : "pending",
+                  status: transferWakeQueued ? "queued" : "pending",
                   attemptCount: 1,
                   lastAttemptAt: now.toISOString(),
                   wakeRequestId: durableTransferWake?.id ?? null,
@@ -1868,7 +1869,7 @@ export function createHeartbeatScheduling(
               eq(issueRecoveryActions.companyId, issue.companyId),
               inArray(issueRecoveryActions.status, ["active", "escalated"]),
             ));
-            if (transferWakeAccepted) {
+            if (transferWakeQueued) {
               enqueued += 1;
               if (stage.key === "warning") {
                 await db.update(issues).set({ executionSlaWarningAt: now, updatedAt: now }).where(and(
@@ -1892,13 +1893,16 @@ export function createHeartbeatScheduling(
                 ownerExecutionWakeRequestId: durableTransferWake?.id ?? null,
                 ownerExecutionWakeStatus: durableTransferWake?.status ?? null,
                 ownerExecutionWakeError: transferWakeError,
-                executionTransferAccepted: transferWakeAccepted,
+                ownerWakeQueued: transferWakeQueued,
+                recipientAcknowledged: false,
+                correctiveExecutionStarted: false,
+                correctiveOutcomeAccepted: false,
                 failedCallEventId: operationMatch.failed.id,
                 matchingSuccessfulCallEventId: operationMatch.success.id,
                 operationEvidenceScope: "exact tool operation only; source objective and production acceptance remain open",
               },
             });
-            if (transferWakeAccepted) continue;
+            if (transferWakeQueued) continue;
           }
         }
         const batchKey = `${issue.companyId}:${target.id}:${stage.key}`;
@@ -1963,8 +1967,8 @@ export function createHeartbeatScheduling(
         ))
         .limit(1)
         .then((rows) => rows[0] ?? null);
-      const delivered = wakeReceipt && !["skipped", "failed", "cancelled"].includes(wakeReceipt.status);
-      if (delivered) {
+      const wakeQueued = wakeReceipt && !["skipped", "failed", "cancelled"].includes(wakeReceipt.status);
+      if (wakeQueued) {
         enqueued += 1;
         for (const issue of batch.issues) {
           // Warning delivery is a stage marker. A breach wake is only a
@@ -1979,7 +1983,7 @@ export function createHeartbeatScheduling(
             companyId: issue.companyId,
             actorType: "system",
             actorId: "heartbeat_scheduler",
-            action: `issue.execution_sla_${batch.stage}_wake_accepted`,
+            action: `issue.execution_sla_${batch.stage}_wake_queued`,
             entityType: "issue",
             entityId: issue.id,
             details: {
@@ -1988,7 +1992,10 @@ export function createHeartbeatScheduling(
               managerAgentId: batch.manager.id,
               wakeRequestId: wakeReceipt.id,
               wakeRequestStatus: wakeReceipt.status,
-              durableWakeReceiptConfirmed: true,
+              durableWakeQueueReceiptConfirmed: true,
+              recipientAcknowledged: false,
+              correctiveWorkStarted: false,
+              correctiveOutcomeAccepted: false,
               ...(batch.stage === "breach" ? { slaObligationOpen: true, wakeIsNotTakeoverOrOutcome: true } : {}),
               batchIssueCount: batch.issues.length,
               attemptedAt: now.toISOString(),
@@ -2012,7 +2019,7 @@ export function createHeartbeatScheduling(
               wakeRequestId: wakeReceipt?.id ?? null,
               wakeRequestStatus: wakeReceipt?.status ?? null,
               wakeEnqueueReturned: Boolean(wake),
-              durableWakeReceiptConfirmed: false,
+              durableWakeQueueReceiptConfirmed: false,
               dispatchError,
               attemptedAt: now.toISOString(),
             },
