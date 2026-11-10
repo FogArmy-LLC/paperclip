@@ -164,6 +164,8 @@ const SAFE_NATIVE_RUN_SPAN_ATTRIBUTE_KEYS = new Set([
   "strategy",
   "target",
 ]);
+const COMPANY_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function finiteMs(value: number): number {
   return Number.isFinite(value) ? Math.max(0, value) : 0;
@@ -199,6 +201,8 @@ function safeAttributes(
  * semantic parent name for developer installs without an OTLP collector.
  */
 export function createNativeRunTrace(input: {
+  /** Trusted run binding from heartbeat/native execution, never span attributes. */
+  companyId: string;
   runId: string;
   startedAtMs?: number;
   onEvent?: NativeRunTraceSink;
@@ -208,12 +212,19 @@ export function createNativeRunTrace(input: {
     input.traceContext ?? getStartupTraceContext("paperclip.native-runner");
   const traceStartedAtMs = finiteMs(input.startedAtMs ?? Date.now());
   const runIdHash = hashedId(input.runId);
+  const hasTrustedCompanyId = COMPANY_ID_PATTERN.test(input.companyId);
+  const traceIdentityAttributes = {
+    ...(hasTrustedCompanyId
+      ? { "paperclip.task.run.company_id": input.companyId }
+      : {}),
+    "paperclip.task.run.run_id": runIdHash,
+  };
   let rootSpan: SpanHandle;
   try {
     rootSpan = tracing.tracer.startSpan("task.run", {
       startTime: traceStartedAtMs,
       attributes: {
-        "paperclip.task.run.run_id": runIdHash,
+        ...traceIdentityAttributes,
         "paperclip.task.run.runtime": "paperclip_runner",
         "paperclip.task.run.trace_schema_version":
           NATIVE_RUN_TRACE_SCHEMA_VERSION,
@@ -328,6 +339,7 @@ export function createNativeRunTrace(input: {
         {
           startTime: startedAtMs,
           attributes: {
+            ...traceIdentityAttributes,
             "paperclip.native.span.trace_schema_version":
               NATIVE_RUN_TRACE_SCHEMA_VERSION,
             ...Object.fromEntries(
@@ -534,6 +546,7 @@ export type NativeRunTrace = ReturnType<typeof createNativeRunTrace>;
 
 /** Emit preparation failure even when execution aborts before a native session exists. */
 export async function recordFailedSkillPreparation(input: {
+  companyId: string;
   runId: string;
   startedAtMs: number;
   onEvent?: NativeRunTraceSink;

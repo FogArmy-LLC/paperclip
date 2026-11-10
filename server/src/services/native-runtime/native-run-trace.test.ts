@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 
 import type { AdapterRuntimeEvent } from "../../adapters/index.js";
@@ -104,6 +105,7 @@ describe("native runner performance trace", () => {
       });
       const events: AdapterRuntimeEvent[] = [];
       const trace = createNativeRunTrace({
+        companyId: "company-a",
         runId: "answer-run",
         startedAtMs: starts.runStartedAtMs,
         traceContext: createRecordingTraceContext().traceContext,
@@ -202,6 +204,7 @@ describe("native runner performance trace", () => {
         preparationStartedAtMs: attemptStartedAtMs,
       });
       const trace = createNativeRunTrace({
+        companyId: "company-a",
         runId: "same-run",
         startedAtMs: starts.runStartedAtMs,
         traceContext,
@@ -237,6 +240,7 @@ describe("native runner performance trace", () => {
   it("persists measured spans with bounded run-relative timing", async () => {
     const events: AdapterRuntimeEvent[] = [];
     const trace = createNativeRunTrace({
+      companyId: "company-a",
       runId: "run-secret-id",
       startedAtMs: 1_000,
       onEvent: async (event) => {
@@ -276,6 +280,7 @@ describe("native runner performance trace", () => {
   it("records failed measurements without changing the original error", async () => {
     const events: AdapterRuntimeEvent[] = [];
     const trace = createNativeRunTrace({
+      companyId: "company-a",
       runId: "run-1",
       onEvent: async (event) => {
         events.push(event);
@@ -302,7 +307,7 @@ describe("native runner performance trace", () => {
 
   it("records skills.prepare beneath preparation with no attributes and tolerates a failed log sink", async () => {
     const { traceContext, spans } = createRecordingTraceContext();
-    const trace = createNativeRunTrace({ runId: "skills-run", startedAtMs: 100,
+    const trace = createNativeRunTrace({ companyId: "company-a", runId: "skills-run", startedAtMs: 100,
       traceContext, onEvent: async () => { throw new Error("run log unavailable"); } });
     const preparation = trace.start("task.prepare", { parentName: "task.run", startedAtMs: 100 });
     await expect(trace.record({ name: "skills.prepare", parentName: "task.prepare", startedAtMs: 120, endedAtMs: 170 })).resolves.toBeUndefined();
@@ -314,7 +319,7 @@ describe("native runner performance trace", () => {
   it("emits failed skill preparation without starting execution, even when the log sink fails", async () => {
     const events: AdapterRuntimeEvent[] = [];
     const { traceContext, spans } = createRecordingTraceContext();
-    await recordFailedSkillPreparation({ runId: "failed-skills", startedAtMs: Date.now() - 10,
+    await recordFailedSkillPreparation({ companyId: "company-a", runId: "failed-skills", startedAtMs: Date.now() - 10,
       traceContext, onEvent: async (event) => { events.push(event); throw new Error("log unavailable"); } });
     expect(events.find((event) => event.payload?.span === "skills.prepare")?.payload).toMatchObject({
       span: "skills.prepare", parentSpan: "task.prepare", outcome: "failed",
@@ -325,6 +330,7 @@ describe("native runner performance trace", () => {
 
   it("never fails runner control flow when its event sink fails", async () => {
     const trace = createNativeRunTrace({
+      companyId: "company-a",
       runId: "run-1",
       onEvent: vi.fn(async () => {
         throw new Error("telemetry unavailable");
@@ -337,10 +343,80 @@ describe("native runner performance trace", () => {
     await expect(trace.finish("ok")).resolves.toBeUndefined();
   });
 
+  it("binds every native span to trusted company and hashed run identity only", async () => {
+    const companyId = "018f4d2a-7c91-7abc-8def-0123456789ab";
+    const runId = "private-run-id";
+    const { traceContext, spans } = createRecordingTraceContext();
+    const events: AdapterRuntimeEvent[] = [];
+    const trace = createNativeRunTrace({
+      companyId,
+      runId,
+      traceContext,
+      onEvent: async (event) => {
+        events.push(event);
+      },
+    });
+    const child = trace.start("native.child", {
+      attributes: {
+        // Identity is system-owned, never overridable through span attributes.
+        "paperclip.task.run.company_id":
+          "018f4d2a-7c91-7abc-8def-ffffffffffff",
+        "paperclip.task.run.run_id": runId,
+        prompt: "private prompt text",
+        url: "https://private.example/path",
+      },
+    });
+    await trace.end(child);
+    await trace.finish("ok");
+
+    const expectedRunHash = createHash("sha256")
+      .update(runId)
+      .digest("hex")
+      .slice(0, 12);
+    for (const span of spans) {
+      expect(span.attributes).toMatchObject({
+        "paperclip.task.run.company_id": companyId,
+        "paperclip.task.run.run_id": expectedRunHash,
+      });
+      expect(span.attributes).not.toHaveProperty("prompt");
+      expect(span.attributes).not.toHaveProperty("url");
+    }
+    expect(spans.find((span) => span.name === "native.child")?.attributes[
+      "paperclip.task.run.run_id"
+    ]).not.toBe(runId);
+    expect(events.some((event) =>
+      JSON.stringify(event.payload).includes("private prompt text"),
+    )).toBe(false);
+    expect(events.some((event) =>
+      JSON.stringify(event.payload).includes("private.example"),
+    )).toBe(false);
+  });
+
+  it("fails closed when the trusted company binding is not a UUID", async () => {
+    const { traceContext, spans } = createRecordingTraceContext();
+    const trace = createNativeRunTrace({
+      companyId: "https://foreign.example/?prompt=private",
+      runId: "run-1",
+      traceContext,
+    });
+    const child = trace.start("native.child");
+    await trace.end(child);
+    await trace.finish("ok");
+
+    expect(spans.every((span) =>
+      !Object.hasOwn(span.attributes, "paperclip.task.run.company_id"),
+    )).toBe(true);
+    expect(spans.every((span) =>
+      span.attributes["paperclip.task.run.run_id"] ===
+        createHash("sha256").update("run-1").digest("hex").slice(0, 12),
+    )).toBe(true);
+  });
+
   it("creates a foldable canonical hierarchy with real parent contexts", async () => {
     const events: AdapterRuntimeEvent[] = [];
     const { traceContext, spans } = createRecordingTraceContext();
     const trace = createNativeRunTrace({
+      companyId: "company-a",
       runId: "run-1",
       startedAtMs: 1_000,
       traceContext,
