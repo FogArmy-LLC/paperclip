@@ -4964,6 +4964,11 @@ const issueListSelect = {
   `,
   status: issues.status,
   statusVersion: issues.statusVersion,
+  executionSlaFirstIdentifiedAt: issues.executionSlaFirstIdentifiedAt,
+  executionSlaWarningAttemptAt: issues.executionSlaWarningAttemptAt,
+  executionSlaBreachAttemptAt: issues.executionSlaBreachAttemptAt,
+  executionSlaWarningAt: issues.executionSlaWarningAt,
+  executionSlaBreachAt: issues.executionSlaBreachAt,
   lastStatusDecisionId: issues.lastStatusDecisionId,
   workMode: issues.workMode,
   harnessKind: issues.harnessKind,
@@ -10392,6 +10397,15 @@ export function issueService(db: Db) {
           issueNumber,
           identifier,
         } as typeof issues.$inferInsert;
+        // The first-identified execution clock is server-owned and immutable.
+        const createdAt = values.createdAt ?? new Date();
+        values.createdAt = createdAt;
+        // Creation is not itself a finding. Start the SLA clock only when
+        // the source issue is first explicitly identified as blocked.
+        if (values.status === "blocked") {
+          values.blockedTransitionAt = createdAt;
+          values.executionSlaFirstIdentifiedAt = createdAt;
+        }
         if (values.status === "in_progress" && !values.startedAt) {
           values.startedAt = new Date();
         }
@@ -10886,6 +10900,8 @@ export function issueService(db: Db) {
         expectedExecutionPolicy,
         ...issueData
       } = data;
+      // Callers cannot rewrite the first-identified timestamp through issue updates.
+      delete issueData.executionSlaFirstIdentifiedAt;
       // An explicit edit claims the title, even if it keeps the same text.
       if (issueData.title !== undefined) issueData.titleNeedsGeneration = false;
       if (
@@ -10973,6 +10989,7 @@ export function issueService(db: Db) {
       if (existing.status !== "blocked" && issueData.status === "blocked") {
         patch.blockedTransitionAt = patch.updatedAt;
         patch.blockedOwnerNotifiedAt = null;
+        patch.executionSlaFirstIdentifiedAt = existing.executionSlaFirstIdentifiedAt ?? patch.updatedAt;
       } else if (
         existing.status === "blocked" &&
         issueData.status &&

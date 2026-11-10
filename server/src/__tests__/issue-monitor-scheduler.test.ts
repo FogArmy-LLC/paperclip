@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { PROVIDER_QUOTA_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
 import {
@@ -18,6 +18,18 @@ import {
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  projects,
+  projectWorkspaces,
+  toolApplications,
+  toolConnections,
+  connectionGrants,
+  issueAccessGrants,
+  toolConnectionInstalls,
+  toolCatalogEntries,
+  toolProfiles,
+  toolProfileEntries,
+  toolProfileBindings,
+  toolCallEvents,
   issueDocuments,
   issues,
   workspaceRuntimeServices,
@@ -118,6 +130,8 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(companySkills);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
     await db.delete(companies);
   }
 
@@ -151,14 +165,22 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   async function seedFixture(input?: {
     agentStatus?: "active" | "paused";
-    issueStatus?: "in_progress" | "in_review";
+    issueStatus?: "in_progress" | "in_review" | "blocked" | "done" | "cancelled";
     monitorAttemptCount?: number;
     monitor?: Record<string, unknown>;
+    executionSlaEnabled?: boolean;
+    critical?: boolean;
+    createdAt?: Date;
+    withManager?: boolean;
+    managerStatus?: "active" | "paused";
+    managerReportsToAlternate?: boolean;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
-    const nextCheckAt = new Date("2026-04-11T12:30:00.000Z");
+    const nextCheckAt = input?.monitor?.nextCheckAt
+      ? new Date(String(input.monitor.nextCheckAt))
+      : new Date("2026-04-11T12:30:00.000Z");
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
     const monitorAttemptCount = input?.monitorAttemptCount ?? 0;
@@ -175,7 +197,41 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
+      executionSlaEnabled: input?.executionSlaEnabled ?? false,
     });
+
+    const alternateManagerId = input?.withManager && input.managerReportsToAlternate
+      ? randomUUID()
+      : null;
+    if (alternateManagerId) {
+      await db.insert(agents).values({
+        id: alternateManagerId,
+        companyId,
+        name: "Alternate Manager Bot",
+        role: "manager",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: { command: process.execPath, args: ["-e", ""], cwd: process.cwd() },
+        runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
+        permissions: {},
+      });
+    }
+
+    const managerId = input?.withManager ? randomUUID() : null;
+    if (managerId) {
+      await db.insert(agents).values({
+        id: managerId,
+        companyId,
+        name: "Manager Bot",
+        role: "manager",
+        status: input?.managerStatus ?? "active",
+        adapterType: "process",
+        adapterConfig: { command: process.execPath, args: ["-e", ""], cwd: process.cwd() },
+        runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
+        permissions: {},
+        reportsTo: alternateManagerId,
+      });
+    }
 
     await db.insert(agents).values({
       id: agentId,
@@ -196,6 +252,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         },
       },
       permissions: {},
+      reportsTo: managerId,
     });
     seededAgentIds.add(agentId);
 
@@ -204,7 +261,11 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       companyId,
       title: "Watch external deploy",
       status: input?.issueStatus ?? "in_progress",
-      priority: "medium",
+      priority: input?.critical ? "critical" : "medium",
+      ...(input?.createdAt ? { createdAt: input.createdAt } : {}),
+      ...(input?.issueStatus === "blocked"
+        ? { executionSlaFirstIdentifiedAt: input.createdAt ?? new Date() }
+        : {}),
       assigneeAgentId: agentId,
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
@@ -248,6 +309,426 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
     return { companyId, agentId, issueId, nextCheckAt };
   }
+
+  it("warns the manager at 30 minutes and escalates at 45 for ordinary-priority work from the immutable clock", async () => {
+    const firstIdentifiedAt = new Date("2026-04-11T12:00:00.000Z");
+    const { companyId, agentId, issueId } = await seedFixture({
+      executionSlaEnabled: true,
+      issueStatus: "blocked",
+      createdAt: firstIdentifiedAt,
+      withManager: true,
+      managerReportsToAlternate: true,
+      monitor: { nextCheckAt: "2027-04-11T12:30:00.000Z" },
+    });
+    const managerId = await db.select({ id: agents.id }).from(agents)
+      .where(sql`${agents.companyId} = ${companyId} and ${agents.name} = 'Manager Bot'`)
+      .then(rows => rows[0]!.id);
+    const alternateManagerId = await db.select({ id: agents.id }).from(agents)
+      .where(sql`${agents.companyId} = ${companyId} and ${agents.name} = 'Alternate Manager Bot'`)
+      .then(rows => rows[0]!.id);
+    const heartbeat = heartbeatService(db);
+
+    expect((await heartbeat.tickTimers(new Date("2026-04-11T12:29:59.999Z"))).enqueued).toBe(0);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+
+    await heartbeat.tickTimers(new Date("2026-04-11T12:30:00.000Z"));
+    const warningWake = await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, managerId));
+    expect(warningWake).toHaveLength(1);
+    expect(warningWake[0]?.reason).toBe("critical_execution_sla_warning");
+    expect(warningWake[0]?.idempotencyKey).toContain(`execution-sla:${companyId}:${managerId}:warning:`);
+    expect(warningWake[0]?.payload).toMatchObject({ issueIds: [issueId] });
+    await waitForHeartbeatIdle();
+    await db.update(agentWakeupRequests).set({
+      status: "queued",
+      error: null,
+      requestedAt: new Date("2026-04-11T12:30:00.000Z"),
+      finishedAt: null,
+    }).where(eq(agentWakeupRequests.id, warningWake[0]!.id));
+
+    // Repeating the scheduler tick cannot duplicate the warning or reset the clock.
+    await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, managerId))).toHaveLength(1);
+    const [warningReceipt] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(warningReceipt.createdAt.toISOString()).toBe(firstIdentifiedAt.toISOString());
+    expect(warningReceipt.executionSlaFirstIdentifiedAt?.toISOString()).toBe(firstIdentifiedAt.toISOString());
+    expect(warningReceipt.executionSlaWarningAt?.toISOString()).toBe("2026-04-11T12:30:00.000Z");
+    expect(warningReceipt.assigneeAgentId).toBe(agentId);
+
+    await heartbeat.tickTimers(new Date("2026-04-11T12:44:59.999Z"));
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, managerId))).toHaveLength(1);
+    const activeRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: activeRunId,
+      companyId,
+      agentId,
+      nativeIssueId: issueId,
+      runtimeMode: "native",
+      status: "running",
+      contextSnapshot: { issueId },
+    });
+    await heartbeat.tickTimers(new Date("2026-04-11T12:45:00.000Z"));
+    const dispatched = await db.select().from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.companyId} = ${companyId} and ${agentWakeupRequests.reason} like 'critical_execution_sla_%'`);
+    const dispatchedByStage = [...dispatched].sort((a, b) => a.reason.localeCompare(b.reason));
+    expect(dispatchedByStage.map(row => row.reason)).toEqual([
+      "critical_execution_sla_breach",
+      "critical_execution_sla_warning",
+    ]);
+    const warningDispatch = dispatchedByStage.find(row => row.reason === "critical_execution_sla_warning");
+    const breachDispatch = dispatchedByStage.find(row => row.reason === "critical_execution_sla_breach");
+    expect(warningDispatch?.agentId).toBe(managerId);
+    expect(breachDispatch?.agentId).toBe(alternateManagerId);
+    expect(breachDispatch?.payload).toMatchObject({ issueIds: [issueId] });
+    expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, activeRunId), eq(heartbeatRuns.status, "running")))).toHaveLength(1);
+    const [stillOwned] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(stillOwned.assigneeAgentId).toBe(agentId);
+    await heartbeat.tickTimers(new Date("2026-04-11T12:46:00.000Z"));
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, managerId))).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, alternateManagerId))).toHaveLength(1);
+    const [breachReceipt] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(breachReceipt.executionSlaBreachAt).toBeNull();
+    expect(breachReceipt.assigneeAgentId).toBe(agentId);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, activeRunId));
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, issueId));
+
+    const slaActivities = await db.select().from(activityLog)
+      .where(sql`${activityLog.entityId} = ${issueId} and ${activityLog.action} like 'issue.execution_sla_%_wake_queued'`);
+    expect(slaActivities.map(row => row.action).sort()).toEqual([
+      "issue.execution_sla_breach_wake_queued",
+      "issue.execution_sla_warning_wake_queued",
+    ]);
+    expect(slaActivities.every(row => row.details && typeof row.details === "object" &&
+      (row.details as Record<string, unknown>).recipientAcknowledged === false &&
+      (row.details as Record<string, unknown>).correctiveWorkStarted === false &&
+      (row.details as Record<string, unknown>).correctiveOutcomeAccepted === false)).toBe(true);
+  });
+
+  it("keeps execution SLA opt-in and excludes terminal or cross-company issues", async () => {
+    const firstIdentifiedAt = new Date("2026-04-11T12:00:00.000Z");
+    const enabled = await seedFixture({ executionSlaEnabled: true, issueStatus: "blocked", createdAt: firstIdentifiedAt, withManager: true, monitor: { nextCheckAt: "2027-04-11T12:30:00.000Z" } });
+    const notIdentified = await seedFixture({ executionSlaEnabled: true, issueStatus: "in_progress", createdAt: firstIdentifiedAt, withManager: true, monitor: { nextCheckAt: "2027-04-11T12:30:00.000Z" } });
+    const disabled = await seedFixture({ executionSlaEnabled: false, issueStatus: "blocked", createdAt: firstIdentifiedAt, withManager: true, monitor: { nextCheckAt: "2027-04-11T12:30:00.000Z" } });
+    const terminal = await seedFixture({ executionSlaEnabled: true, issueStatus: "done", createdAt: firstIdentifiedAt, withManager: true, monitor: { nextCheckAt: "2027-04-11T12:30:00.000Z" } });
+
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:45:00.000Z"));
+    const enabledWakes = await db.select().from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.companyId} = ${enabled.companyId} and ${agentWakeupRequests.reason} like 'critical_execution_sla_%'`);
+    expect(enabledWakes.map(row => row.reason)).toEqual(["critical_execution_sla_breach"]);
+    expect(await db.select().from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.companyId} = ${disabled.companyId} and ${agentWakeupRequests.reason} like 'critical_execution_sla_%'`)).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.companyId} = ${notIdentified.companyId} and ${agentWakeupRequests.reason} like 'critical_execution_sla_%'`)).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.companyId} = ${terminal.companyId} and ${agentWakeupRequests.reason} like 'critical_execution_sla_%'`)).toHaveLength(0);
+  });
+
+  it("transfers an approaching-SLA issue only with an exact failed operation, matching scoped success, and current grants", async () => {
+    const firstIdentifiedAt = new Date("2026-04-11T12:00:00.000Z");
+    const seeded = await seedFixture({
+      executionSlaEnabled: true,
+      issueStatus: "blocked",
+      createdAt: firstIdentifiedAt,
+      withManager: true,
+      managerReportsToAlternate: true,
+    });
+    const managerId = await db.select({ id: agents.id }).from(agents)
+      .where(sql`${agents.companyId} = ${seeded.companyId} and ${agents.name} = 'Manager Bot'`)
+      .then(rows => rows[0]!.id);
+    const alternateManagerId = await db.select({ id: agents.id }).from(agents)
+      .where(sql`${agents.companyId} = ${seeded.companyId} and ${agents.name} = 'Alternate Manager Bot'`)
+      .then(rows => rows[0]!.id);
+    const projectId = randomUUID();
+    const workspaceId = randomUUID();
+    const applicationId = randomUUID();
+    const connectionId = randomUUID();
+    const profileId = randomUUID();
+    const issuePrefix = `T${seeded.companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(projects).values({ id: projectId, companyId: seeded.companyId, name: "Source project", status: "in_progress" });
+    await db.insert(projectWorkspaces).values({ id: workspaceId, companyId: seeded.companyId, projectId, name: "registered repo", repoUrl: "https://github.com/example/registered", defaultRef: "main", isPrimary: true });
+    await db.update(issues).set({ projectId, projectWorkspaceId: workspaceId }).where(eq(issues.id, seeded.issueId));
+    await db.insert(issues).values({
+      companyId: seeded.companyId, projectId, projectWorkspaceId: workspaceId,
+      title: "Prior exact operation", status: "done", assigneeAgentId: managerId,
+      issueNumber: 2, identifier: `${issuePrefix}-2`,
+    });
+    await db.insert(toolApplications).values({ id: applicationId, companyId: seeded.companyId, name: "GitHub", type: "mcp_http", status: "active" });
+    await db.insert(toolConnections).values({
+      id: connectionId, companyId: seeded.companyId, applicationId, name: "Registered GitHub",
+      uid: "registered-github", transport: "mcp_remote", connectionPurpose: "tool",
+      authKind: "none", status: "active", enabled: true, credentialPolicy: "shared",
+    });
+    await db.insert(connectionGrants).values({ companyId: seeded.companyId, connectionId, kind: "organization", status: "active" });
+    await db.insert(toolConnectionInstalls).values({ companyId: seeded.companyId, connectionId, targetType: "company", targetId: seeded.companyId });
+    const [catalogEntry] = await db.insert(toolCatalogEntries).values({
+      companyId: seeded.companyId, applicationId, connectionId, name: "push", toolName: "github.push",
+      versionHash: "catalog-v1", status: "active", riskLevel: "write", isReadOnly: false, isWrite: true,
+    }).returning();
+    await db.insert(toolProfiles).values({ id: profileId, companyId: seeded.companyId, profileKey: "manager-github", name: "Manager GitHub", status: "active", defaultAction: "deny" });
+    await db.insert(toolProfileEntries).values({ companyId: seeded.companyId, profileId, selectorType: "catalog_entry", effect: "include", catalogEntryId: catalogEntry!.id });
+    await db.insert(toolProfileBindings).values({ companyId: seeded.companyId, profileId, targetType: "agent", targetId: alternateManagerId });
+    const requestHash = "same-protected-operation";
+    const [prior] = await db.select({ id: issues.id }).from(issues).where(eq(issues.identifier, `${issuePrefix}-2`));
+    await db.insert(toolCallEvents).values([
+      { companyId: seeded.companyId, issueId: seeded.issueId, agentId: seeded.agentId, connectionId, toolName: "github.push", requestHash, eventType: "call_denied", outcome: "denied", createdAt: new Date("2026-04-11T12:20:00.000Z") },
+      { companyId: seeded.companyId, issueId: prior!.id, agentId: alternateManagerId, connectionId, toolName: "github.push", requestHash, eventType: "call_completed", outcome: "success", createdAt: new Date("2026-04-10T12:00:00.000Z") },
+    ]);
+
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:30:00.000Z"));
+    const [reassigned] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    expect(reassigned!.assigneeAgentId).toBe(alternateManagerId);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, seeded.issueId)))
+      .toMatchObject([expect.objectContaining({ kind: "execution_sla_takeover", previousOwnerAgentId: seeded.agentId, returnOwnerAgentId: seeded.agentId, ownerAgentId: alternateManagerId, status: "active" })]);
+    expect(await db.select().from(agentWakeupRequests).where(sql`${agentWakeupRequests.companyId} = ${seeded.companyId} and ${agentWakeupRequests.reason} = 'issue_assigned'`))
+      .toMatchObject([expect.objectContaining({ agentId: alternateManagerId, payload: expect.objectContaining({ issueId: seeded.issueId, source: "execution_sla_takeover" }) })]);
+    const [warningStage] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    expect(warningStage!.executionSlaWarningAt?.toISOString()).toBe("2026-04-11T12:30:00.000Z");
+
+  });
+
+  it("retries a failed takeover dispatch without waiting for a real execution attempt", async () => {
+    const firstIdentifiedAt = new Date("2026-04-11T12:00:00.000Z");
+    const seeded = await seedFixture({
+      executionSlaEnabled: true,
+      issueStatus: "blocked",
+      createdAt: firstIdentifiedAt,
+      withManager: true,
+    });
+    const managerId = await db.select({ id: agents.id }).from(agents)
+      .where(sql`${agents.companyId} = ${seeded.companyId} and ${agents.name} = 'Manager Bot'`)
+      .then(rows => rows[0]!.id);
+    const priorWakeId = randomUUID();
+    const recoveryId = randomUUID();
+    await db.update(issues).set({
+      assigneeAgentId: managerId,
+      executionSlaWarningAt: firstIdentifiedAt,
+    }).where(eq(issues.id, seeded.issueId));
+    await db.insert(agentWakeupRequests).values({
+      id: priorWakeId,
+      companyId: seeded.companyId,
+      agentId: managerId,
+      source: "assignment",
+      reason: "issue_assigned",
+      status: "failed",
+      idempotencyKey: `execution-sla-takeover:${recoveryId}:1`,
+      payload: { issueId: seeded.issueId, taskId: seeded.issueId, source: "execution_sla_takeover" },
+      requestedAt: firstIdentifiedAt,
+      finishedAt: new Date("2026-04-11T12:00:01.000Z"),
+      error: "Injected dispatch failure before recipient execution.",
+    });
+    await db.insert(issueRecoveryActions).values({
+      id: recoveryId,
+      companyId: seeded.companyId,
+      sourceIssueId: seeded.issueId,
+      kind: "execution_sla_takeover",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      previousOwnerAgentId: seeded.agentId,
+      returnOwnerAgentId: seeded.agentId,
+      cause: "execution_sla_takeover_dispatch_failed",
+      fingerprint: `execution-sla:${seeded.issueId}`,
+      evidence: {
+        stage: "warning",
+        executionSlaDispatch: {
+          status: "queued",
+          attemptCount: 1,
+          lastAttemptAt: firstIdentifiedAt.toISOString(),
+          wakeRequestId: priorWakeId,
+        },
+      },
+      nextAction: "Retry the bounded dispatch to the already verified capable agent.",
+      attemptCount: 1,
+      lastAttemptAt: firstIdentifiedAt,
+      createdAt: firstIdentifiedAt,
+      updatedAt: firstIdentifiedAt,
+    });
+
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:06:00.000Z"));
+
+    const retriedWakes = await db.select().from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.companyId} = ${seeded.companyId} and ${agentWakeupRequests.reason} = 'issue_assigned'`);
+    expect(retriedWakes).toHaveLength(2);
+    const retryWake = retriedWakes.find((row) => row.id !== priorWakeId);
+    expect(retryWake?.agentId).toBe(managerId);
+    expect(retryWake?.idempotencyKey).not.toBe(`execution-sla-takeover:${recoveryId}:1`);
+    const [recovery] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, recoveryId));
+    expect(recovery?.evidence.executionSlaDispatch).toMatchObject({ status: "queued", wakeRequestId: retryWake!.id });
+  });
+
+  it("reconciles a stale queued takeover wake before retrying it", async () => {
+    const firstIdentifiedAt = new Date("2026-04-11T12:00:00.000Z");
+    const seeded = await seedFixture({
+      executionSlaEnabled: true,
+      issueStatus: "blocked",
+      createdAt: firstIdentifiedAt,
+      withManager: true,
+    });
+    const managerId = await db.select({ id: agents.id }).from(agents)
+      .where(sql`${agents.companyId} = ${seeded.companyId} and ${agents.name} = 'Manager Bot'`)
+      .then(rows => rows[0]!.id);
+    const priorWakeId = randomUUID();
+    const recoveryId = randomUUID();
+    await db.update(issues).set({
+      assigneeAgentId: managerId,
+      executionSlaWarningAt: firstIdentifiedAt,
+    }).where(eq(issues.id, seeded.issueId));
+    await db.insert(agentWakeupRequests).values({
+      id: priorWakeId,
+      companyId: seeded.companyId,
+      agentId: managerId,
+      source: "assignment",
+      reason: "issue_assigned",
+      status: "queued",
+      idempotencyKey: `execution-sla-takeover:${recoveryId}:1`,
+      payload: { issueId: seeded.issueId, taskId: seeded.issueId, source: "execution_sla_takeover" },
+      requestedAt: firstIdentifiedAt,
+    });
+    await db.insert(issueRecoveryActions).values({
+      id: recoveryId,
+      companyId: seeded.companyId,
+      sourceIssueId: seeded.issueId,
+      kind: "execution_sla_takeover",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      previousOwnerAgentId: seeded.agentId,
+      returnOwnerAgentId: seeded.agentId,
+      cause: "execution_sla_takeover_dispatch_stale",
+      fingerprint: `execution-sla:${seeded.issueId}`,
+      evidence: {
+        stage: "warning",
+        executionSlaDispatch: {
+          status: "queued",
+          attemptCount: 1,
+          lastAttemptAt: firstIdentifiedAt.toISOString(),
+          wakeRequestId: priorWakeId,
+        },
+      },
+      nextAction: "Reconcile the stale wake and retry the bounded dispatch.",
+      attemptCount: 1,
+      lastAttemptAt: firstIdentifiedAt,
+      createdAt: firstIdentifiedAt,
+      updatedAt: firstIdentifiedAt,
+    });
+
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:06:00.000Z"));
+
+    const wakes = await db.select().from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.companyId} = ${seeded.companyId} and ${agentWakeupRequests.reason} = 'issue_assigned'`);
+    expect(wakes).toHaveLength(2);
+    expect(wakes.find((row) => row.id === priorWakeId)?.status).toBe("failed");
+    const retryWake = wakes.find((row) => row.id !== priorWakeId);
+    expect(retryWake?.agentId).toBe(managerId);
+    const [recovery] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, recoveryId));
+    expect(recovery?.evidence.executionSlaDispatch).toMatchObject({ status: "queued", wakeRequestId: retryWake!.id });
+  });
+
+  it("records an unavailable manager, preserves the original deadline, and retries after capability recovery", async () => {
+    const firstIdentifiedAt = new Date("2026-04-11T12:00:00.000Z");
+    const { companyId, issueId } = await seedFixture({
+      executionSlaEnabled: true,
+      issueStatus: "blocked",
+      createdAt: firstIdentifiedAt,
+      withManager: true,
+      managerStatus: "paused",
+      monitor: { nextCheckAt: "2027-04-11T12:30:00.000Z" },
+    });
+    const managerId = await db.select({ id: agents.id }).from(agents)
+      .where(sql`${agents.companyId} = ${companyId} and ${agents.name} = 'Manager Bot'`)
+      .then(rows => rows[0]!.id);
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:45:00.000Z"));
+    expect(await db.select().from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.companyId} = ${companyId} and ${agentWakeupRequests.reason} like 'critical_execution_sla_%'`)).toHaveLength(0);
+    const events = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(events.map(row => row.action)).toContain("issue.execution_sla_breach_manager_unavailable");
+    const [receipt] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(receipt.createdAt.toISOString()).toBe(firstIdentifiedAt.toISOString());
+    expect(receipt.executionSlaBreachAt).toBeNull();
+    expect(receipt.executionSlaBreachAttemptAt?.toISOString()).toBe("2026-04-11T12:45:00.000Z");
+
+    await db.update(agents).set({ status: "active" }).where(eq(agents.id, managerId));
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:50:00.000Z"));
+    const wakes = await db.select().from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.companyId} = ${companyId} and ${agentWakeupRequests.reason} = 'critical_execution_sla_breach'`);
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]?.payload).toMatchObject({ issueIds: [issueId] });
+    const [retried] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(retried.executionSlaFirstIdentifiedAt?.toISOString()).toBe(firstIdentifiedAt.toISOString());
+    expect(retried.executionSlaBreachAt).toBeNull();
+    expect(retried.executionSlaBreachAttemptAt?.toISOString()).toBe("2026-04-11T12:50:00.000Z");
+  });
+
+  it("does not disclose private issue context to an ungranted same-company manager", async () => {
+    const { companyId, issueId } = await seedFixture({
+      executionSlaEnabled: true,
+      issueStatus: "blocked",
+      createdAt: new Date("2026-04-11T12:00:00.000Z"),
+      withManager: true,
+    });
+    await db.update(issues).set({ visibility: "private" }).where(eq(issues.id, issueId));
+
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:45:00.000Z"));
+
+    expect(await db.select().from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.companyId} = ${companyId} and ${agentWakeupRequests.reason} like 'critical_execution_sla_%'`))
+      .toHaveLength(0);
+    const events = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(events.map(row => row.action)).toContain("issue.execution_sla_breach_manager_unavailable");
+    expect(events.some(row => JSON.stringify(row.details).includes("Watch external deploy"))).toBe(false);
+  });
+
+  it("rechecks private issue access under the ownership lock after candidate precheck", async () => {
+    const { companyId, agentId, issueId } = await seedFixture({
+      executionSlaEnabled: true,
+      issueStatus: "blocked",
+      createdAt: new Date("2026-04-11T12:00:00.000Z"),
+      withManager: true,
+    });
+    const managerId = await db.select({ id: agents.id }).from(agents)
+      .where(sql`${agents.companyId} = ${companyId} and ${agents.name} = 'Manager Bot'`)
+      .then(rows => rows[0]!.id);
+    const projectId = randomUUID();
+    const workspaceId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId, name: "Private source project", status: "in_progress" });
+    await db.insert(projectWorkspaces).values({ id: workspaceId, companyId, projectId, name: "registered repo", repoUrl: "https://github.com/example/registered", defaultRef: "main", isPrimary: true });
+    await db.update(issues).set({ projectId, projectWorkspaceId: workspaceId, visibility: "private" }).where(eq(issues.id, issueId));
+    const [grant] = await db.insert(issueAccessGrants).values({
+      issueId,
+      subjectType: "agent",
+      subjectId: managerId,
+      source: "explicit",
+    }).returning({ id: issueAccessGrants.id });
+
+    // The scheduler's first transaction is the ownership transfer, after the
+    // target passed its candidate-read precheck. Revoke the access grant in
+    // that gap and let the locked transaction prove it revalidates ACL.
+    const dbWithTransaction = db as unknown as {
+      transaction: (callback: (tx: unknown) => Promise<unknown>, config?: unknown) => Promise<unknown>;
+    };
+    const originalTransaction = dbWithTransaction.transaction.bind(db);
+    let revokedBetweenChecks = false;
+    dbWithTransaction.transaction = async (callback, config) => {
+      if (!revokedBetweenChecks) {
+        revokedBetweenChecks = true;
+        await db.update(issueAccessGrants).set({ revokedAt: new Date("2026-04-11T12:30:00.000Z") })
+          .where(eq(issueAccessGrants.id, grant!.id));
+      }
+      dbWithTransaction.transaction = originalTransaction;
+      return originalTransaction(callback, config);
+    };
+
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:30:00.000Z"));
+
+    expect(revokedBetweenChecks).toBe(true);
+    expect(await db.select().from(issues).where(eq(issues.id, issueId)))
+      .toMatchObject([expect.objectContaining({ assigneeAgentId: agentId, visibility: "private" })]);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.companyId} = ${companyId} and ${agentWakeupRequests.reason} = 'issue_assigned'`))
+      .toHaveLength(0);
+  });
 
   it("triggers due issue monitors once and clears the one-shot schedule", async () => {
     const { issueId, agentId } = await seedFixture();

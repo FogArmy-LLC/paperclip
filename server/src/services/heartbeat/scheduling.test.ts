@@ -34,6 +34,7 @@ function callbacks(db: Db) {
     issuesSvc: {
       listReviewAttention: vi.fn<HeartbeatSchedulingDependencies["issuesSvc"]["listReviewAttention"]>(async () => new Map()),
       create: vi.fn<HeartbeatSchedulingDependencies["issuesSvc"]["create"]>(),
+      updateForCompany: vi.fn<HeartbeatSchedulingDependencies["issuesSvc"]["updateForCompany"]>(),
     },
     enqueueWakeup: vi.fn<HeartbeatSchedulingDependencies["enqueueWakeup"]>(async () => admitted),
     scheduleBoundedRetryForRun: vi.fn<HeartbeatSchedulingDependencies["scheduleBoundedRetryForRun"]>(),
