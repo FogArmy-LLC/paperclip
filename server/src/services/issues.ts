@@ -10398,9 +10398,14 @@ export function issueService(db: Db) {
           identifier,
         } as typeof issues.$inferInsert;
         // The first-identified execution clock is server-owned and immutable.
-        const firstIdentifiedAt = values.createdAt ?? new Date();
-        values.createdAt = firstIdentifiedAt;
-        values.executionSlaFirstIdentifiedAt = firstIdentifiedAt;
+        const createdAt = values.createdAt ?? new Date();
+        values.createdAt = createdAt;
+        // Creation is not itself a finding. Start the SLA clock only when
+        // the source issue is first explicitly identified as blocked.
+        if (values.status === "blocked") {
+          values.blockedTransitionAt = createdAt;
+          values.executionSlaFirstIdentifiedAt = createdAt;
+        }
         if (values.status === "in_progress" && !values.startedAt) {
           values.startedAt = new Date();
         }
@@ -10984,6 +10989,7 @@ export function issueService(db: Db) {
       if (existing.status !== "blocked" && issueData.status === "blocked") {
         patch.blockedTransitionAt = patch.updatedAt;
         patch.blockedOwnerNotifiedAt = null;
+        patch.executionSlaFirstIdentifiedAt = existing.executionSlaFirstIdentifiedAt ?? patch.updatedAt;
       } else if (
         existing.status === "blocked" &&
         issueData.status &&

@@ -10,12 +10,14 @@ Content-Type: application/json
 {"executionSlaEnabled": true}
 ```
 
-The setting is off by default. All nonterminal issues in an active company are
-covered, regardless of department, assignee type, priority, or status. The
-first-identified clock is server-owned and immutable; it is not reset by
-comments, status changes, retries, priority changes, or reassignment. For
-pre-upgrade issues with no recorded transition, the issue creation time is the
-earliest available clock evidence.
+The setting is off by default. All nonterminal issues with a recorded blocked
+transition in an active company are covered, regardless of department,
+assignee type, priority, or later status. Issue creation alone is not a blocker
+finding. The first blocked transition is server-owned and immutable; it is not
+reset by comments, unblocking, retries, priority changes, or reassignment.
+Pre-upgrade blocked issues use their recorded blocked-transition time. A legacy
+issue with no blocker event time remains unqualified; creation time is not
+substituted.
 
 The existing heartbeat scheduler dispatches a warning to the first invokable
 manager in the original assignee's reporting chain after 30 minutes, or the

@@ -151,7 +151,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   async function seedFixture(input?: {
     agentStatus?: "active" | "paused";
-    issueStatus?: "in_progress" | "in_review" | "done" | "cancelled";
+    issueStatus?: "in_progress" | "in_review" | "blocked" | "done" | "cancelled";
     monitorAttemptCount?: number;
     monitor?: Record<string, unknown>;
     executionSlaEnabled?: boolean;
@@ -230,7 +230,9 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       status: input?.issueStatus ?? "in_progress",
       priority: input?.critical ? "critical" : "medium",
       ...(input?.createdAt ? { createdAt: input.createdAt } : {}),
-      executionSlaFirstIdentifiedAt: input?.createdAt ?? new Date(),
+      ...(input?.issueStatus === "blocked"
+        ? { executionSlaFirstIdentifiedAt: input.createdAt ?? new Date() }
+        : {}),
       assigneeAgentId: agentId,
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
@@ -279,6 +281,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     const firstIdentifiedAt = new Date("2026-04-11T12:00:00.000Z");
     const { companyId, agentId, issueId } = await seedFixture({
       executionSlaEnabled: true,
+      issueStatus: "blocked",
       createdAt: firstIdentifiedAt,
       withManager: true,
       monitor: { nextCheckAt: "2027-04-11T12:30:00.000Z" },
@@ -317,18 +320,19 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       "critical_execution_sla_warning",
       "critical_execution_sla_breach",
     ]);
-    expect(dispatched[1]?.payload).toMatchObject({ issueId });
+    expect(dispatched[1]?.payload).toMatchObject({ issueIds: [issueId] });
     await heartbeat.tickTimers(new Date("2026-04-11T12:46:00.000Z"));
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, managerId))).toHaveLength(2);
     const [breachReceipt] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(breachReceipt.executionSlaBreachAt?.toISOString()).toBe("2026-04-11T12:45:00.000Z");
+    expect(breachReceipt.executionSlaBreachAt).toBeNull();
     expect(breachReceipt.assigneeAgentId).toBe(agentId);
   });
 
   it("keeps execution SLA opt-in and excludes terminal or cross-company issues", async () => {
     const firstIdentifiedAt = new Date("2026-04-11T12:00:00.000Z");
-    const enabled = await seedFixture({ executionSlaEnabled: true, createdAt: firstIdentifiedAt, withManager: true, monitor: { nextCheckAt: "2027-04-11T12:30:00.000Z" } });
-    const disabled = await seedFixture({ executionSlaEnabled: false, createdAt: firstIdentifiedAt, withManager: true, monitor: { nextCheckAt: "2027-04-11T12:30:00.000Z" } });
+    const enabled = await seedFixture({ executionSlaEnabled: true, issueStatus: "blocked", createdAt: firstIdentifiedAt, withManager: true, monitor: { nextCheckAt: "2027-04-11T12:30:00.000Z" } });
+    const notIdentified = await seedFixture({ executionSlaEnabled: true, issueStatus: "in_progress", createdAt: firstIdentifiedAt, withManager: true, monitor: { nextCheckAt: "2027-04-11T12:30:00.000Z" } });
+    const disabled = await seedFixture({ executionSlaEnabled: false, issueStatus: "blocked", createdAt: firstIdentifiedAt, withManager: true, monitor: { nextCheckAt: "2027-04-11T12:30:00.000Z" } });
     const terminal = await seedFixture({ executionSlaEnabled: true, issueStatus: "done", createdAt: firstIdentifiedAt, withManager: true, monitor: { nextCheckAt: "2027-04-11T12:30:00.000Z" } });
 
     await heartbeatService(db).tickTimers(new Date("2026-04-11T12:45:00.000Z"));
@@ -338,6 +342,8 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(await db.select().from(agentWakeupRequests)
       .where(sql`${agentWakeupRequests.companyId} = ${disabled.companyId} and ${agentWakeupRequests.reason} like 'critical_execution_sla_%'`)).toHaveLength(0);
     expect(await db.select().from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.companyId} = ${notIdentified.companyId} and ${agentWakeupRequests.reason} like 'critical_execution_sla_%'`)).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests)
       .where(sql`${agentWakeupRequests.companyId} = ${terminal.companyId} and ${agentWakeupRequests.reason} like 'critical_execution_sla_%'`)).toHaveLength(0);
   });
 
@@ -345,6 +351,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     const firstIdentifiedAt = new Date("2026-04-11T12:00:00.000Z");
     const { companyId, issueId } = await seedFixture({
       executionSlaEnabled: true,
+      issueStatus: "blocked",
       createdAt: firstIdentifiedAt,
       withManager: true,
       managerStatus: "paused",

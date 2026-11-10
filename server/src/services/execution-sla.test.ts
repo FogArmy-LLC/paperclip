@@ -12,9 +12,12 @@ describe("execution SLA timing", () => {
     expect(executionSlaStage({ firstIdentifiedAt: identifiedAt, now: at(45), warningAt: null, breachAt: null })).toBe("breach");
   });
 
-  it("sends breach only when first observed after the deadline and never reopens terminal stages", () => {
+  it("keeps the breach stage open until a result-qualified breach timestamp exists", () => {
     expect(executionSlaStage({ firstIdentifiedAt: identifiedAt, now: at(46), warningAt: null, breachAt: null })).toBe("breach");
     expect(executionSlaStage({ firstIdentifiedAt: identifiedAt, now: at(46), warningAt: at(30), breachAt: null })).toBe("breach");
+    // A durable manager wake is not an outcome. The scheduler leaves breachAt
+    // null, so the obligation remains visible and retryable.
+    expect(executionSlaStage({ firstIdentifiedAt: identifiedAt, now: at(90), warningAt: at(30), breachAt: null })).toBe("breach");
     expect(executionSlaStage({ firstIdentifiedAt: identifiedAt, now: at(60), warningAt: at(30), breachAt: at(45) })).toBeNull();
   });
 

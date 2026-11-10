@@ -1171,7 +1171,7 @@ export function createHeartbeatScheduling(
         status: issues.status,
         assigneeAgentId: issues.assigneeAgentId,
         assigneeUserId: issues.assigneeUserId,
-        firstIdentifiedAt: sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.createdAt})`.mapWith(issues.createdAt),
+        firstIdentifiedAt: sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.blockedTransitionAt})`.mapWith(issues.executionSlaFirstIdentifiedAt),
         executionSlaWarningAttemptAt: issues.executionSlaWarningAttemptAt,
         executionSlaBreachAttemptAt: issues.executionSlaBreachAttemptAt,
         executionSlaWarningAt: issues.executionSlaWarningAt,
@@ -1184,16 +1184,16 @@ export function createHeartbeatScheduling(
         eq(companies.executionSlaEnabled, true),
         isNull(issues.hiddenAt),
         inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
-        lte(sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.createdAt})`, warningCutoff),
+        lte(sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.blockedTransitionAt})`, warningCutoff),
         or(
           and(
             isNull(issues.executionSlaBreachAt),
-            lte(sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.createdAt})`, breachCutoff),
+            lte(sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.blockedTransitionAt})`, breachCutoff),
             or(isNull(issues.executionSlaBreachAttemptAt), lte(issues.executionSlaBreachAttemptAt, retryCutoff)),
           ),
           and(
             isNull(issues.executionSlaBreachAt),
-            gt(sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.createdAt})`, breachCutoff),
+            gt(sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.blockedTransitionAt})`, breachCutoff),
             isNull(issues.executionSlaWarningAt),
             or(isNull(issues.executionSlaWarningAttemptAt), lte(issues.executionSlaWarningAttemptAt, retryCutoff)),
           ),
@@ -1201,6 +1201,49 @@ export function createHeartbeatScheduling(
       ))
       .orderBy(asc(issues.createdAt), asc(issues.id))
       .limit(100);
+
+    // A pending SLA wake or an active source run is real bounded work, not a
+    // reason to open another recovery lane. Keep the breach obligation open,
+    // but coalesce until that execution returns or the wake ages out.
+    const dueIssueIds = dueIssues.map((issue) => issue.id);
+    const activeIssueIds = new Set<string>();
+    const pendingWakeIssueIds = new Set<string>();
+    if (dueIssueIds.length > 0) {
+      const activeRuns = await db
+        .select({ nativeIssueId: heartbeatRuns.nativeIssueId, issueId: heartbeatRuns.issueId })
+        .from(heartbeatRuns)
+        .where(and(
+          inArray(heartbeatRuns.companyId, [...new Set(dueIssues.map((issue) => issue.companyId))]),
+          inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+          or(
+            inArray(heartbeatRuns.nativeIssueId, dueIssueIds),
+            inArray(heartbeatRuns.issueId, dueIssueIds),
+          ),
+        ));
+      for (const run of activeRuns) {
+        if (run.nativeIssueId) activeIssueIds.add(run.nativeIssueId);
+        if (run.issueId) activeIssueIds.add(run.issueId);
+      }
+      const pendingWakes = await db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(and(
+          inArray(agentWakeupRequests.companyId, [...new Set(dueIssues.map((issue) => issue.companyId))]),
+          inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+          inArray(agentWakeupRequests.reason, ["critical_execution_sla_warning", "critical_execution_sla_breach"]),
+          gte(agentWakeupRequests.requestedAt, retryCutoff),
+        ));
+      for (const request of pendingWakes) {
+        const payload = parseObject(request.payload);
+        const issueIds = Array.isArray(payload.issueIds)
+          ? payload.issueIds.filter((id): id is string => typeof id === "string")
+          : [];
+        const singleIssueId = readNonEmptyString(payload.issueId ?? payload.taskId);
+        for (const issueId of [...issueIds, ...(singleIssueId ? [singleIssueId] : [])]) {
+          pendingWakeIssueIds.add(issueId);
+        }
+      }
+    }
 
     let enqueued = 0;
     let skipped = 0;
@@ -1212,6 +1255,10 @@ export function createHeartbeatScheduling(
       issues: typeof dueIssues;
     }>();
     for (const issue of dueIssues) {
+      if (activeIssueIds.has(issue.id) || pendingWakeIssueIds.has(issue.id)) {
+        skipped += 1;
+        continue;
+      }
       const owner = issue.assigneeAgentId ? agentById.get(issue.assigneeAgentId) : null;
       const directManagerId = owner?.reportsTo ?? null;
       const stageKey = executionSlaStage({
@@ -1352,18 +1399,20 @@ export function createHeartbeatScheduling(
       const delivered = wakeReceipt && !["skipped", "failed", "cancelled"].includes(wakeReceipt.status);
       if (delivered) {
         enqueued += 1;
-        const marker = batch.attemptColumn === "warning" ? issues.executionSlaWarningAt : issues.executionSlaBreachAt;
         for (const issue of batch.issues) {
-          await db.update(issues)
-            .set(batch.attemptColumn === "warning"
-              ? { executionSlaWarningAt: now, updatedAt: now }
-              : { executionSlaBreachAt: now, updatedAt: now })
-            .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId), isNull(marker)));
+          // Warning delivery is a stage marker. A breach wake is only a
+          // handoff request: it cannot satisfy the outcome SLA, so keep the
+          // breach open for a later result/recovery transition.
+          if (batch.attemptColumn === "warning") {
+            await db.update(issues)
+              .set({ executionSlaWarningAt: now, updatedAt: now })
+              .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId), isNull(issues.executionSlaWarningAt)));
+          }
           await logActivity(db, {
             companyId: issue.companyId,
             actorType: "system",
             actorId: "heartbeat_scheduler",
-            action: `issue.execution_sla_${batch.stage}_dispatched`,
+            action: `issue.execution_sla_${batch.stage}_wake_accepted`,
             entityType: "issue",
             entityId: issue.id,
             details: {
@@ -1373,6 +1422,7 @@ export function createHeartbeatScheduling(
               wakeRequestId: wakeReceipt.id,
               wakeRequestStatus: wakeReceipt.status,
               durableWakeReceiptConfirmed: true,
+              ...(batch.stage === "breach" ? { slaObligationOpen: true, wakeIsNotTakeoverOrOutcome: true } : {}),
               batchIssueCount: batch.issues.length,
               attemptedAt: now.toISOString(),
             },
