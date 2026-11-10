@@ -16,7 +16,7 @@ import { errorHandler } from "../../../middleware/error-handler.js";
 import { createLifecycleDriver } from "../../../services/agent-lifecycle-driver.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { agents, approvals, projects, issues, heartbeatRuns, nativeRunFinalizations, budgetPolicies, environmentLeases, agentApiKeys, activityLog, agentConfigRevisions, userCompanyPreferences, companies, companyMemberships, principalPermissionGrants, plugins, pluginCompanySettings, createDb, type Db } from "@paperclipai/db";
+import { agents, approvals, projects, issues, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, budgetPolicies, environmentLeases, agentApiKeys, activityLog, agentConfigRevisions, userCompanyPreferences, companies, companyMemberships, principalPermissionGrants, plugins, pluginCompanySettings, createDb, type Db } from "@paperclipai/db";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../../__tests__/helpers/embedded-postgres.js";
 import { createAgentLifecycle, configureAgentLifecycle } from "../../../services/agent-lifecycle.js";
@@ -149,6 +149,41 @@ const support = await getEmbeddedPostgresTestSupport();
     await work.process(agent.id);
     expect((await current(agent.id)).lifecycleState).toBe("terminated");
   });
+
+  it.each(["preparing", "settled"] as const)(
+    "advances lifecycle after an obsolete %s continuation is cancelled before adapter dispatch",
+    async (executionStage) => {
+      const agent = await hire();
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId: agent.id,
+        status: "cancelled",
+        invocationSource: "on_demand",
+        runtimeMode: "legacy",
+        runnerProfileJson: { adapterDispatch: { adapterType: "claude_local" } },
+        executionStage,
+        startedAt: new Date(),
+        finishedAt: new Date(),
+        errorCode: "continuation_task_ownership_changed",
+        resultJson: { cancellation: {
+          reason: "continuation_task_ownership_changed",
+          source: "control_plane",
+          expected: true,
+        } },
+      }).returning();
+
+      expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
+      await db.insert(heartbeatRunEvents).values({
+        companyId,
+        runId: run.id,
+        agentId: agent.id,
+        eventType: "adapter.invoke",
+        seq: 1,
+        payload: {},
+      });
+      expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(false);
+    },
+  );
 
   it("does not cancel a reporting agent when its manager pauses", async () => {
     const parent = await hire();
