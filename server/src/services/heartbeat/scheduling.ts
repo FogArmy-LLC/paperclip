@@ -7,6 +7,11 @@ import {
   agentTaskSessions,
   agentSessionGoalActions,
   agents,
+  toolCallEvents,
+  toolConnections,
+  connectionGrants,
+  issueRecoveryActions,
+  workspaceOperations,
 } from "@paperclipai/db";
 import {
   type IssueExecutionMonitorPolicy,
@@ -53,7 +58,12 @@ import { logger } from "../../middleware/logger.js";
 import { failRunnerGoalAction } from "../runner-goals.js";
 import { evaluateAgentInvokability } from "../agent-invokability.js";
 import { issueReadSqlCondition } from "../authorization.js";
-import { executionSlaRetryDue, executionSlaStage } from "../execution-sla.js";
+import {
+  executionSlaRetryDue,
+  executionSlaStage,
+  matchingExecutionSlaCapabilityReceipt,
+} from "../execution-sla.js";
+import { toolAccessService } from "../tool-access.js";
 import type { Db } from "@paperclipai/db";
 import type { issueService } from "../issues.js";
 import type { createHeartbeatQueue } from "./queue.js";
@@ -68,7 +78,7 @@ export interface HeartbeatSchedulingDependencies
   extends Pick<HeartbeatRetryDependencies, "getRun" | "getAgent" | "getWorktreeExecutionCutoff">,
     Pick<HeartbeatQueue, "enqueueWakeup" | "parseHeartbeatPolicy" | "claimDueTimerHeartbeat">,
     Pick<RunPreparation, "toAgentOrgRow" | "groupAgentOrgRowsByCompany"> {
-  issuesSvc: Pick<ReturnType<typeof issueService>, "listReviewAttention" | "create">;
+  issuesSvc: Pick<ReturnType<typeof issueService>, "listReviewAttention" | "create" | "updateForCompany">;
   scheduleBoundedRetryForRun: ReturnType<typeof createHeartbeatRetries>["scheduleBoundedRetryForRun"];
   getSchedulingSuppression: () => Promise<{ suppressed: boolean }>;
 }
@@ -1167,12 +1177,14 @@ export function createHeartbeatScheduling(
       .select({
         id: issues.id,
         companyId: issues.companyId,
+        projectWorkspaceId: issues.projectWorkspaceId,
         identifier: issues.identifier,
         title: issues.title,
         status: issues.status,
         assigneeAgentId: issues.assigneeAgentId,
         assigneeUserId: issues.assigneeUserId,
         firstIdentifiedAt: sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.blockedTransitionAt})`.mapWith(issues.executionSlaFirstIdentifiedAt),
+        blockedTransitionAt: issues.blockedTransitionAt,
         executionSlaWarningAttemptAt: issues.executionSlaWarningAttemptAt,
         executionSlaBreachAttemptAt: issues.executionSlaBreachAttemptAt,
         executionSlaWarningAt: issues.executionSlaWarningAt,
@@ -1231,7 +1243,7 @@ export function createHeartbeatScheduling(
         .where(and(
           inArray(agentWakeupRequests.companyId, [...new Set(dueIssues.map((issue) => issue.companyId))]),
           inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
-          inArray(agentWakeupRequests.reason, ["critical_execution_sla_warning", "critical_execution_sla_breach"]),
+          inArray(agentWakeupRequests.reason, ["critical_execution_sla_warning", "critical_execution_sla_breach", "issue_assigned"]),
           gte(agentWakeupRequests.requestedAt, retryCutoff),
         ));
       for (const request of pendingWakes) {
@@ -1244,6 +1256,121 @@ export function createHeartbeatScheduling(
           pendingWakeIssueIds.add(issueId);
         }
       }
+    }
+
+    async function matchingCurrentOperation(
+      issue: (typeof dueIssues)[number],
+      candidate: typeof agents.$inferSelect,
+      readDb: Db = db,
+    ) {
+      if (!issue.projectWorkspaceId || !issue.assigneeAgentId) return null;
+      // Capability evidence must identify the same concrete connection as the
+      // latest failed source operation, so gather the source failures first.
+      const sourceEvents = await readDb
+        .select({
+          id: toolCallEvents.id,
+          companyId: toolCallEvents.companyId,
+          issueId: toolCallEvents.issueId,
+          agentId: toolCallEvents.agentId,
+          connectionId: toolCallEvents.connectionId,
+          toolName: toolCallEvents.toolName,
+          requestHash: toolCallEvents.requestHash,
+          outcome: toolCallEvents.outcome,
+          eventType: toolCallEvents.eventType,
+          createdAt: toolCallEvents.createdAt,
+          projectWorkspaceId: issues.projectWorkspaceId,
+        })
+        .from(toolCallEvents)
+        .innerJoin(issues, and(eq(issues.id, toolCallEvents.issueId), eq(issues.companyId, toolCallEvents.companyId)))
+        .where(and(
+          eq(toolCallEvents.companyId, issue.companyId),
+          eq(toolCallEvents.issueId, issue.id),
+          eq(toolCallEvents.agentId, issue.assigneeAgentId),
+          eq(issues.projectWorkspaceId, issue.projectWorkspaceId),
+          gte(toolCallEvents.createdAt, issue.blockedTransitionAt ?? issue.firstIdentifiedAt),
+          lte(toolCallEvents.createdAt, now),
+          inArray(toolCallEvents.eventType, ["call_failed", "call_denied"]),
+        ))
+        .orderBy(desc(toolCallEvents.createdAt))
+        .limit(10);
+      const latestSource = sourceEvents[0];
+      if (!latestSource?.connectionId || !latestSource.toolName || !latestSource.requestHash) return null;
+      const connection = await readDb
+        .select({ id: toolConnections.id, credentialPolicy: toolConnections.credentialPolicy })
+        .from(toolConnections)
+        .where(and(
+          eq(toolConnections.id, latestSource.connectionId),
+          eq(toolConnections.companyId, issue.companyId),
+          eq(toolConnections.enabled, true),
+          eq(toolConnections.status, "active"),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (!connection) return null;
+
+      const effective = await toolAccessService(readDb).getEffectiveProfilesForAgent(issue.companyId, candidate.id);
+      const installed = effective.installedConnections.some((item) =>
+        item.id === connection.id && item.enabled && item.status === "active",
+      );
+      const allowed = effective.allowedTools.some((item) =>
+        item.connectionId === connection.id && item.toolName === latestSource.toolName,
+      );
+      if (!installed || !allowed) return null;
+      if (connection.credentialPolicy !== "shared" && connection.credentialPolicy !== "per_agent") return null;
+      const grantScope = connection.credentialPolicy === "shared"
+        ? and(eq(connectionGrants.kind, "organization"), isNull(connectionGrants.subjectAgentId))
+        : and(eq(connectionGrants.kind, "agent"), eq(connectionGrants.subjectAgentId, candidate.id));
+      const grant = await readDb.select({ id: connectionGrants.id }).from(connectionGrants).where(and(
+        eq(connectionGrants.companyId, issue.companyId),
+        eq(connectionGrants.connectionId, connection.id),
+        grantScope,
+        eq(connectionGrants.status, "active"),
+        isNull(connectionGrants.revokedAt),
+      )).limit(1);
+      if (grant.length === 0) return null;
+
+      const candidateEvents = await readDb
+        .select({
+          id: toolCallEvents.id,
+          companyId: toolCallEvents.companyId,
+          issueId: toolCallEvents.issueId,
+          agentId: toolCallEvents.agentId,
+          connectionId: toolCallEvents.connectionId,
+          toolName: toolCallEvents.toolName,
+          requestHash: toolCallEvents.requestHash,
+          outcome: toolCallEvents.outcome,
+          eventType: toolCallEvents.eventType,
+          createdAt: toolCallEvents.createdAt,
+          projectWorkspaceId: issues.projectWorkspaceId,
+        })
+        .from(toolCallEvents)
+        .innerJoin(issues, and(eq(issues.id, toolCallEvents.issueId), eq(issues.companyId, toolCallEvents.companyId)))
+        .where(and(
+          eq(toolCallEvents.companyId, issue.companyId),
+          eq(toolCallEvents.agentId, candidate.id),
+          eq(toolCallEvents.connectionId, connection.id),
+          eq(toolCallEvents.toolName, latestSource.toolName),
+          eq(toolCallEvents.requestHash, latestSource.requestHash),
+          eq(toolCallEvents.eventType, "call_completed"),
+          eq(toolCallEvents.outcome, "success"),
+          eq(issues.projectWorkspaceId, issue.projectWorkspaceId),
+          gte(toolCallEvents.createdAt, new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)),
+          lte(toolCallEvents.createdAt, now),
+        ))
+        .orderBy(desc(toolCallEvents.createdAt))
+        .limit(10);
+      const match = matchingExecutionSlaCapabilityReceipt({
+        companyId: issue.companyId,
+        sourceIssueId: issue.id,
+        sourceOwnerAgentId: issue.assigneeAgentId,
+        candidateAgentId: candidate.id,
+        projectWorkspaceId: issue.projectWorkspaceId,
+        blockedSince: issue.blockedTransitionAt ?? issue.firstIdentifiedAt,
+        now,
+        maxAgeMs: 30 * 24 * 60 * 60 * 1000,
+        sourceEvents,
+        candidateEvents,
+      });
+      return match ? { ...match, connectionId: connection.id, toolName: latestSource.toolName } : null;
     }
 
     let enqueued = 0;
@@ -1351,6 +1478,168 @@ export function createHeartbeatScheduling(
             },
           });
           continue;
+        }
+
+        // Emergency transfer is considered only after the explicit 30-minute
+        // warning threshold or 45-minute breach threshold has been reached.
+        // A manager wake remains useful when no exact, current operation proof
+        // exists, but it is not an execution transfer or SLA completion.
+        const operationMatch = stage.key === "warning" || stage.key === "breach"
+          ? await matchingCurrentOperation(issue, target)
+          : null;
+        if (operationMatch && issue.assigneeAgentId && target.id !== issue.assigneeAgentId) {
+          const transferred = await db.transaction(async (tx) => {
+            const [current] = await tx.select({
+              id: issues.id,
+              companyId: issues.companyId,
+              status: issues.status,
+              assigneeAgentId: issues.assigneeAgentId,
+              projectWorkspaceId: issues.projectWorkspaceId,
+              executionSlaFirstIdentifiedAt: issues.executionSlaFirstIdentifiedAt,
+              blockedTransitionAt: issues.blockedTransitionAt,
+            }).from(issues).where(and(
+              eq(issues.id, issue.id),
+              eq(issues.companyId, issue.companyId),
+            )).for("update");
+            if (!current || current.assigneeAgentId !== issue.assigneeAgentId ||
+              current.projectWorkspaceId !== issue.projectWorkspaceId ||
+              (current.executionSlaFirstIdentifiedAt ?? current.blockedTransitionAt)?.getTime() !== issue.firstIdentifiedAt.getTime() ||
+              current.blockedTransitionAt?.getTime() !== issue.blockedTransitionAt?.getTime() ||
+              !["backlog", "todo", "in_progress", "in_review", "blocked"].includes(current.status)) return null;
+
+            // Revalidate the exact operation receipt and current bindings in the
+            // same transaction that fences ownership transfer.
+            const verifiedMatch = await matchingCurrentOperation(issue, target, tx as unknown as Db);
+            if (!verifiedMatch || verifiedMatch.failed.id !== operationMatch.failed.id ||
+              verifiedMatch.success.id !== operationMatch.success.id) return null;
+
+            const [activeRun] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, issue.companyId),
+              inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+              or(eq(heartbeatRuns.nativeIssueId, issue.id), eq(heartbeatRuns.issueId, issue.id)),
+            )).limit(1);
+            const [activeOperation] = await tx.select({ id: workspaceOperations.id }).from(workspaceOperations).where(and(
+              eq(workspaceOperations.companyId, issue.companyId),
+              eq(workspaceOperations.issueId, issue.id),
+              eq(workspaceOperations.status, "running"),
+            )).limit(1);
+            const [activeRecovery] = await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+              eq(issueRecoveryActions.companyId, issue.companyId),
+              eq(issueRecoveryActions.sourceIssueId, issue.id),
+              inArray(issueRecoveryActions.status, ["active", "escalated"]),
+            )).limit(1);
+            if (activeRun || activeOperation || activeRecovery) return null;
+
+            const fingerprint = `execution-sla:${stage.key}:${issue.firstIdentifiedAt.toISOString()}:${operationMatch.failed.id}:${target.id}`;
+            const updated = await issuesSvc.updateForCompany(issue.id, issue.companyId, {
+              assigneeAgentId: target.id,
+              assigneeUserId: null,
+            }, tx);
+            if (!updated) return null;
+            const [action] = await tx.insert(issueRecoveryActions).values({
+              companyId: issue.companyId,
+              sourceIssueId: issue.id,
+              kind: "execution_sla_takeover",
+              status: "active",
+              ownerType: "agent",
+              ownerAgentId: target.id,
+              previousOwnerAgentId: issue.assigneeAgentId,
+              returnOwnerAgentId: issue.assigneeAgentId,
+              cause: "execution_sla_operation_failure",
+              fingerprint,
+              evidence: {
+                stage: stage.key,
+                firstIdentifiedAt: issue.firstIdentifiedAt.toISOString(),
+                originalOwnerAgentId: issue.assigneeAgentId,
+                takeoverAgentId: target.id,
+                projectWorkspaceId: issue.projectWorkspaceId,
+                connectionId: verifiedMatch.connectionId,
+                toolName: verifiedMatch.toolName,
+                failedCallEventId: verifiedMatch.failed.id,
+                matchingSuccessfulCallEventId: verifiedMatch.success.id,
+                requestHash: verifiedMatch.failed.requestHash,
+                operationEvidenceScope: "exact tool operation only; not source objective completion or production acceptance",
+              },
+              nextAction: "Resume the original source issue using the verified operation capability; preserve its objective, independent acceptance, production gates, and return ownership.",
+              lastAttemptAt: now,
+              updatedAt: now,
+            }).returning({ id: issueRecoveryActions.id });
+            return action ? { id: action.id } : null;
+          });
+          if (transferred) {
+            const idempotencyWindow = Math.floor(now.getTime() / (5 * 60 * 1000));
+            const idempotencyKey = `execution-sla-takeover:${transferred.id}:${idempotencyWindow}`;
+            let transferWake: Awaited<ReturnType<typeof enqueueWakeup>> | null = null;
+            let transferWakeError: string | null = null;
+            try {
+              transferWake = await enqueueWakeup(target.id, {
+                source: "assignment",
+                triggerDetail: "system",
+                reason: "issue_assigned",
+                idempotencyKey,
+                requestedByActorType: "system",
+                requestedByActorId: "heartbeat_scheduler",
+                payload: { issueId: issue.id, taskId: issue.id, source: "execution_sla_takeover" },
+                contextSnapshot: {
+                  source: "execution_sla_takeover",
+                  issueId: issue.id,
+                  taskId: issue.id,
+                  executionSlaTakeover: {
+                    actionId: transferred.id,
+                    stage: stage.key,
+                    firstIdentifiedAt: issue.firstIdentifiedAt.toISOString(),
+                    originalOwnerAgentId: issue.assigneeAgentId,
+                    returnOwnerAgentId: issue.assigneeAgentId,
+                    exactToolOperationReceiptId: operationMatch.success.id,
+                    operationEvidenceScope: "exact tool operation only; source objective and production acceptance remain open",
+                  },
+                },
+                issueStateGuard: {
+                  statuses: ["backlog", "todo", "in_progress", "in_review", "blocked"],
+                  assigneeAgentId: target.id,
+                },
+              });
+            } catch (error) {
+              transferWakeError = error instanceof Error ? error.message : String(error);
+            }
+            const durableTransferWake = await db.select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+              .from(agentWakeupRequests)
+              .where(and(eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.idempotencyKey, idempotencyKey)))
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
+            const transferWakeAccepted = Boolean(durableTransferWake && !["failed", "cancelled", "skipped"].includes(durableTransferWake.status));
+            if (transferWakeAccepted) {
+              enqueued += 1;
+              if (stage.key === "warning") {
+                await db.update(issues).set({ executionSlaWarningAt: now, updatedAt: now }).where(and(
+                  eq(issues.id, issue.id), eq(issues.companyId, issue.companyId), isNull(issues.executionSlaWarningAt),
+                ));
+              }
+            }
+            await logActivity(db, {
+              companyId: issue.companyId,
+              actorType: "system",
+              actorId: "heartbeat_scheduler",
+              action: `issue.execution_sla_${stage.key}_execution_transferred`,
+              entityType: "issue",
+              entityId: issue.id,
+              details: {
+                firstIdentifiedAt: issue.firstIdentifiedAt.toISOString(),
+                managerAgentId: target.id,
+                originalOwnerAgentId: issue.assigneeAgentId,
+                recoveryActionKind: "execution_sla_takeover",
+                recoveryActionId: transferred.id,
+                ownerExecutionWakeRequestId: durableTransferWake?.id ?? null,
+                ownerExecutionWakeStatus: durableTransferWake?.status ?? null,
+                ownerExecutionWakeError: transferWakeError,
+                executionTransferAccepted: transferWakeAccepted,
+                failedCallEventId: operationMatch.failed.id,
+                matchingSuccessfulCallEventId: operationMatch.success.id,
+                operationEvidenceScope: "exact tool operation only; source objective and production acceptance remain open",
+              },
+            });
+            if (transferWakeAccepted) continue;
+          }
         }
         const batchKey = `${issue.companyId}:${target.id}:${stage.key}`;
         const batch = batches.get(batchKey) ?? {

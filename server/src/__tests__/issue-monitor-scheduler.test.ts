@@ -18,6 +18,17 @@ import {
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  projects,
+  projectWorkspaces,
+  toolApplications,
+  toolConnections,
+  connectionGrants,
+  toolConnectionInstalls,
+  toolCatalogEntries,
+  toolProfiles,
+  toolProfileEntries,
+  toolProfileBindings,
+  toolCallEvents,
   issueDocuments,
   issues,
   workspaceRuntimeServices,
@@ -365,6 +376,64 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .where(sql`${agentWakeupRequests.companyId} = ${notIdentified.companyId} and ${agentWakeupRequests.reason} like 'critical_execution_sla_%'`)).toHaveLength(0);
     expect(await db.select().from(agentWakeupRequests)
       .where(sql`${agentWakeupRequests.companyId} = ${terminal.companyId} and ${agentWakeupRequests.reason} like 'critical_execution_sla_%'`)).toHaveLength(0);
+  });
+
+  it("transfers an approaching-SLA issue only with an exact failed operation, matching scoped success, and current grants", async () => {
+    const firstIdentifiedAt = new Date("2026-04-11T12:00:00.000Z");
+    const seeded = await seedFixture({
+      executionSlaEnabled: true,
+      issueStatus: "blocked",
+      createdAt: firstIdentifiedAt,
+      withManager: true,
+    });
+    const managerId = await db.select({ id: agents.id }).from(agents)
+      .where(sql`${agents.companyId} = ${seeded.companyId} and ${agents.name} = 'Manager Bot'`)
+      .then(rows => rows[0]!.id);
+    const projectId = randomUUID();
+    const workspaceId = randomUUID();
+    const applicationId = randomUUID();
+    const connectionId = randomUUID();
+    const profileId = randomUUID();
+    const issuePrefix = `T${seeded.companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(projects).values({ id: projectId, companyId: seeded.companyId, name: "Source project", status: "in_progress" });
+    await db.insert(projectWorkspaces).values({ id: workspaceId, companyId: seeded.companyId, projectId, name: "registered repo", repoUrl: "https://github.com/example/registered", defaultRef: "main", isPrimary: true });
+    await db.update(issues).set({ projectId, projectWorkspaceId: workspaceId }).where(eq(issues.id, seeded.issueId));
+    await db.insert(issues).values({
+      companyId: seeded.companyId, projectId, projectWorkspaceId: workspaceId,
+      title: "Prior exact operation", status: "done", assigneeAgentId: managerId,
+      issueNumber: 2, identifier: `${issuePrefix}-2`,
+    });
+    await db.insert(toolApplications).values({ id: applicationId, companyId: seeded.companyId, name: "GitHub", type: "mcp_http", status: "active" });
+    await db.insert(toolConnections).values({
+      id: connectionId, companyId: seeded.companyId, applicationId, name: "Registered GitHub",
+      uid: "registered-github", transport: "mcp_remote", connectionPurpose: "tool",
+      authKind: "none", status: "active", enabled: true, credentialPolicy: "shared",
+    });
+    await db.insert(connectionGrants).values({ companyId: seeded.companyId, connectionId, kind: "organization", status: "active" });
+    await db.insert(toolConnectionInstalls).values({ companyId: seeded.companyId, connectionId, targetType: "company", targetId: seeded.companyId });
+    const [catalogEntry] = await db.insert(toolCatalogEntries).values({
+      companyId: seeded.companyId, applicationId, connectionId, name: "push", toolName: "github.push",
+      versionHash: "catalog-v1", status: "active", riskLevel: "write", isReadOnly: false, isWrite: true,
+    }).returning();
+    await db.insert(toolProfiles).values({ id: profileId, companyId: seeded.companyId, profileKey: "manager-github", name: "Manager GitHub", status: "active", defaultAction: "deny" });
+    await db.insert(toolProfileEntries).values({ companyId: seeded.companyId, profileId, selectorType: "catalog_entry", effect: "include", catalogEntryId: catalogEntry!.id });
+    await db.insert(toolProfileBindings).values({ companyId: seeded.companyId, profileId, targetType: "agent", targetId: managerId });
+    const requestHash = "same-protected-operation";
+    const [prior] = await db.select({ id: issues.id }).from(issues).where(eq(issues.identifier, `${issuePrefix}-2`));
+    await db.insert(toolCallEvents).values([
+      { companyId: seeded.companyId, issueId: seeded.issueId, agentId: seeded.agentId, connectionId, toolName: "github.push", requestHash, eventType: "call_denied", outcome: "denied", createdAt: new Date("2026-04-11T12:20:00.000Z") },
+      { companyId: seeded.companyId, issueId: prior!.id, agentId: managerId, connectionId, toolName: "github.push", requestHash, eventType: "call_completed", outcome: "success", createdAt: new Date("2026-04-10T12:00:00.000Z") },
+    ]);
+
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:30:00.000Z"));
+    const [reassigned] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    expect(reassigned!.assigneeAgentId).toBe(managerId);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, seeded.issueId)))
+      .toMatchObject([expect.objectContaining({ kind: "execution_sla_takeover", previousOwnerAgentId: seeded.agentId, returnOwnerAgentId: seeded.agentId, ownerAgentId: managerId, status: "active" })]);
+    expect(await db.select().from(agentWakeupRequests).where(sql`${agentWakeupRequests.companyId} = ${seeded.companyId} and ${agentWakeupRequests.reason} = 'issue_assigned'`))
+      .toMatchObject([expect.objectContaining({ agentId: managerId, payload: expect.objectContaining({ issueId: seeded.issueId, source: "execution_sla_takeover" }) })]);
+    const [warningStage] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    expect(warningStage!.executionSlaWarningAt?.toISOString()).toBe("2026-04-11T12:30:00.000Z");
   });
 
   it("records an unavailable manager, preserves the original deadline, and retries after capability recovery", async () => {
