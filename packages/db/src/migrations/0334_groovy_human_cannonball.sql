@@ -1,6 +1,6 @@
--- Runs outside a file-wide transaction so the idempotency index can be built
--- without blocking wake writes. Every statement is safe to retry if the process
--- stops before the migration journal entry is committed.
+-- The registered Paperclip migration executor runs this migration's top-level
+-- statements without a file-wide transaction so the index can build without
+-- blocking wake writes. Every statement is safe to retry if interrupted.
 ALTER TABLE "companies" ADD COLUMN IF NOT EXISTS "execution_sla_enabled" boolean DEFAULT false NOT NULL;--> statement-breakpoint
 ALTER TABLE "issues" ADD COLUMN IF NOT EXISTS "execution_sla_first_identified_at" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "issues" ADD COLUMN IF NOT EXISTS "execution_sla_warning_attempt_at" timestamp with time zone;--> statement-breakpoint

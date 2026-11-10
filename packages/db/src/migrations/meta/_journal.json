@@ -2332,6 +2332,13 @@
       "when": 1794290420113,
       "tag": "0334_groovy_human_cannonball",
       "breakpoints": true
+    },
+    {
+      "idx": 335,
+      "version": "7",
+      "when": 1794293981526,
+      "tag": "0335_typical_tigra",
+      "breakpoints": true
     }
   ]
 }

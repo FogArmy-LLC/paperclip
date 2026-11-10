@@ -1174,6 +1174,11 @@ export function createHeartbeatScheduling(
     const warningCutoff = new Date(now.getTime() - 30 * 60 * 1000);
     const breachCutoff = new Date(now.getTime() - 45 * 60 * 1000);
     const retryCutoff = new Date(now.getTime() - 5 * 60 * 1000);
+    const firstIdentifiedAtExpr = sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.blockedTransitionAt})`.mapWith(issues.executionSlaFirstIdentifiedAt);
+    // Raw COALESCE expressions have no column encoder, so bind timestamps as
+    // ISO text with an explicit PostgreSQL cast instead of passing Date bytes.
+    const warningCutoffExpr = sql<Date>`${warningCutoff.toISOString()}::timestamptz`;
+    const breachCutoffExpr = sql<Date>`${breachCutoff.toISOString()}::timestamptz`;
     const dueIssues = await db
       .select({
         id: issues.id,
@@ -1185,7 +1190,7 @@ export function createHeartbeatScheduling(
         status: issues.status,
         assigneeAgentId: issues.assigneeAgentId,
         assigneeUserId: issues.assigneeUserId,
-        firstIdentifiedAt: sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.blockedTransitionAt})`.mapWith(issues.executionSlaFirstIdentifiedAt),
+        firstIdentifiedAt: firstIdentifiedAtExpr,
         blockedTransitionAt: issues.blockedTransitionAt,
         executionSlaWarningAttemptAt: issues.executionSlaWarningAttemptAt,
         executionSlaBreachAttemptAt: issues.executionSlaBreachAttemptAt,
@@ -1199,16 +1204,16 @@ export function createHeartbeatScheduling(
         eq(companies.executionSlaEnabled, true),
         isNull(issues.hiddenAt),
         inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
-        lte(sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.blockedTransitionAt})`, warningCutoff),
+        lte(firstIdentifiedAtExpr, warningCutoffExpr),
         or(
           and(
             isNull(issues.executionSlaBreachAt),
-            lte(sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.blockedTransitionAt})`, breachCutoff),
+            lte(firstIdentifiedAtExpr, breachCutoffExpr),
             or(isNull(issues.executionSlaBreachAttemptAt), lte(issues.executionSlaBreachAttemptAt, retryCutoff)),
           ),
           and(
             isNull(issues.executionSlaBreachAt),
-            gt(sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.blockedTransitionAt})`, breachCutoff),
+            gt(firstIdentifiedAtExpr, breachCutoffExpr),
             isNull(issues.executionSlaWarningAt),
             or(isNull(issues.executionSlaWarningAttemptAt), lte(issues.executionSlaWarningAttemptAt, retryCutoff)),
           ),
@@ -1383,7 +1388,167 @@ export function createHeartbeatScheduling(
       return match ? { ...match, connectionId: connection.id, toolName: latestSource.toolName } : null;
     }
 
+    const retriedTakeoverIssueIds = new Set<string>();
     let enqueued = 0;
+    const pendingTakeovers = await db.select({
+      id: issueRecoveryActions.id,
+      companyId: issueRecoveryActions.companyId,
+      sourceIssueId: issueRecoveryActions.sourceIssueId,
+      ownerAgentId: issueRecoveryActions.ownerAgentId,
+      returnOwnerAgentId: issueRecoveryActions.returnOwnerAgentId,
+      evidence: issueRecoveryActions.evidence,
+      lastAttemptAt: issueRecoveryActions.lastAttemptAt,
+      issueStatus: issues.status,
+      assigneeAgentId: issues.assigneeAgentId,
+      firstIdentifiedAt: firstIdentifiedAtExpr,
+    }).from(issueRecoveryActions)
+      .innerJoin(issues, and(eq(issues.id, issueRecoveryActions.sourceIssueId), eq(issues.companyId, issueRecoveryActions.companyId)))
+      .innerJoin(companies, eq(companies.id, issues.companyId))
+      .where(and(
+        eq(issueRecoveryActions.kind, "execution_sla_takeover"),
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        eq(companies.status, "active"),
+        eq(companies.executionSlaEnabled, true),
+        inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
+      ))
+      .orderBy(asc(issueRecoveryActions.updatedAt))
+      .limit(100);
+
+    // A takeover is not discharged by inserting a recovery row or changing the
+    // owner. Retry an unaccepted owner wake on the existing timer path, with a
+    // durable five-minute attempt boundary and the same source/deadline receipt.
+    for (const pending of pendingTakeovers) {
+      const ownerId = pending.ownerAgentId;
+      const dispatch = parseObject(pending.evidence.executionSlaDispatch);
+      let dispatchStatus = readNonEmptyString(dispatch.status);
+      if (dispatchStatus === "queued" && typeof dispatch.wakeRequestId === "string") {
+        const [previousWake] = await db.select({ status: agentWakeupRequests.status }).from(agentWakeupRequests)
+          .where(and(eq(agentWakeupRequests.id, dispatch.wakeRequestId), eq(agentWakeupRequests.companyId, pending.companyId)))
+          .limit(1);
+        if (!previousWake || ["failed", "cancelled", "skipped"].includes(previousWake.status)) dispatchStatus = "pending";
+      }
+      const lastAttemptAt = pending.lastAttemptAt
+        ?? (typeof dispatch.lastAttemptAt === "string" ? new Date(dispatch.lastAttemptAt) : null);
+      if (!ownerId || dispatchStatus === "queued" ||
+        (lastAttemptAt && lastAttemptAt.getTime() > retryCutoff.getTime()) ||
+        activeIssueIds.has(pending.sourceIssueId) || pendingWakeIssueIds.has(pending.sourceIssueId)) continue;
+      const owner = agentById.get(ownerId);
+      if (!owner || owner.companyId !== pending.companyId ||
+        !evaluateAgentInvokability(toAgentOrgRow(owner), [...agentById.values()].filter((agent) => agent.companyId === pending.companyId).map(toAgentOrgRow)).invokable) continue;
+
+      const claimed = await db.transaction(async (tx) => {
+        const [action] = await tx.select({
+          id: issueRecoveryActions.id,
+          evidence: issueRecoveryActions.evidence,
+          lastAttemptAt: issueRecoveryActions.lastAttemptAt,
+        }).from(issueRecoveryActions).where(and(
+          eq(issueRecoveryActions.id, pending.id),
+          eq(issueRecoveryActions.companyId, pending.companyId),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        )).for("update");
+        if (!action) return null;
+        const currentDispatch = parseObject(action.evidence.executionSlaDispatch);
+        const currentStatus = readNonEmptyString(currentDispatch.status);
+        if (currentStatus === "queued" && typeof currentDispatch.wakeRequestId === "string") {
+          const [previousWake] = await tx.select({ status: agentWakeupRequests.status }).from(agentWakeupRequests)
+            .where(and(eq(agentWakeupRequests.id, currentDispatch.wakeRequestId), eq(agentWakeupRequests.companyId, pending.companyId)))
+            .limit(1);
+          if (previousWake && !["failed", "cancelled", "skipped"].includes(previousWake.status)) return null;
+        } else if (currentStatus === "queued") {
+          return null;
+        }
+        if (action.lastAttemptAt && action.lastAttemptAt.getTime() > retryCutoff.getTime()) return null;
+        const [currentIssue] = await tx.select({
+          id: issues.id,
+          companyId: issues.companyId,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          executionSlaFirstIdentifiedAt: issues.executionSlaFirstIdentifiedAt,
+          blockedTransitionAt: issues.blockedTransitionAt,
+        }).from(issues).where(and(
+          eq(issues.id, pending.sourceIssueId),
+          eq(issues.companyId, pending.companyId),
+          eq(issues.assigneeAgentId, ownerId),
+          inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
+          await issueReadSqlCondition(tx, { type: "agent", agentId: ownerId, companyId: pending.companyId }),
+        )).for("update");
+        if (!currentIssue || (currentIssue.executionSlaFirstIdentifiedAt ?? currentIssue.blockedTransitionAt)?.getTime() !== pending.firstIdentifiedAt.getTime()) return null;
+        const attemptCount = typeof currentDispatch.attemptCount === "number" ? currentDispatch.attemptCount : 0;
+        await tx.update(issueRecoveryActions).set({
+          evidence: {
+            ...action.evidence,
+            executionSlaDispatch: {
+              ...currentDispatch,
+              status: "dispatching",
+              attemptCount: attemptCount + 1,
+              lastAttemptAt: now.toISOString(),
+            },
+          },
+          attemptCount: sql`${issueRecoveryActions.attemptCount} + 1`,
+          lastAttemptAt: now,
+          updatedAt: now,
+        }).where(eq(issueRecoveryActions.id, action.id));
+        return { id: action.id, stage: readNonEmptyString(action.evidence.stage) ?? "breach" };
+      });
+      if (!claimed) continue;
+
+      const window = Math.floor(now.getTime() / (5 * 60 * 1000));
+      const idempotencyKey = `execution-sla-takeover:${claimed.id}:${window}`;
+      let wakeError: string | null = null;
+      try {
+        await enqueueWakeup(ownerId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          idempotencyKey,
+          requestedByActorType: "system",
+          requestedByActorId: "heartbeat_scheduler",
+          payload: { issueId: pending.sourceIssueId, taskId: pending.sourceIssueId, source: "execution_sla_takeover" },
+          contextSnapshot: {
+            source: "execution_sla_takeover",
+            issueId: pending.sourceIssueId,
+            taskId: pending.sourceIssueId,
+            executionSlaTakeover: {
+              actionId: claimed.id,
+              stage: claimed.stage,
+              firstIdentifiedAt: pending.firstIdentifiedAt.toISOString(),
+              originalOwnerAgentId: pending.returnOwnerAgentId,
+              returnOwnerAgentId: pending.returnOwnerAgentId,
+              operationEvidenceScope: "exact tool operation only; source objective and production acceptance remain open",
+            },
+          },
+          issueStateGuard: { statuses: ["backlog", "todo", "in_progress", "in_review", "blocked"], assigneeAgentId: ownerId },
+        });
+      } catch (error) {
+        wakeError = error instanceof Error ? error.message : String(error);
+      }
+      const wake = await db.select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status }).from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.companyId, pending.companyId), eq(agentWakeupRequests.idempotencyKey, idempotencyKey)))
+        .limit(1).then((rows) => rows[0] ?? null);
+      const accepted = Boolean(wake && !["failed", "cancelled", "skipped"].includes(wake.status));
+      await db.update(issueRecoveryActions).set({
+        evidence: {
+          ...pending.evidence,
+          executionSlaDispatch: {
+            ...dispatch,
+            status: accepted ? "queued" : "pending",
+            attemptCount: (typeof dispatch.attemptCount === "number" ? dispatch.attemptCount : 0) + 1,
+            lastAttemptAt: now.toISOString(),
+            wakeRequestId: wake?.id ?? null,
+            wakeStatus: wake?.status ?? null,
+            lastError: wakeError,
+          },
+        },
+        updatedAt: now,
+      }).where(and(
+        eq(issueRecoveryActions.id, pending.id),
+        eq(issueRecoveryActions.companyId, pending.companyId),
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      ));
+      retriedTakeoverIssueIds.add(pending.sourceIssueId);
+      if (accepted) enqueued += 1;
+    }
+
     let skipped = 0;
     const batches = new Map<string, {
       companyId: string;
@@ -1411,9 +1576,16 @@ export function createHeartbeatScheduling(
       // Start with the accountable direct manager for both warning and breach.
       // If that seat is unavailable, the loop below follows reportsTo upward;
       // starting at the manager's manager would skip a capable direct owner.
-      const stageFirstManagerId = directManagerId
+      let stageFirstManagerId = directManagerId
         ?? [...agentById.values()].find((agent) => agent.companyId === issue.companyId && !agent.reportsTo)?.id
         ?? null;
+      if (stageKey === "breach" && issue.executionSlaWarningAt && directManagerId) {
+        // A warning already accepted by the first manager but not acted on by
+        // the 45-minute point advances one level in the same reporting chain.
+        // If no higher manager is configured, retain the direct manager as the
+        // executable resolver rather than dropping the open breach.
+        stageFirstManagerId = agentById.get(directManagerId)?.reportsTo ?? directManagerId;
+      }
       const stages = stageKey && executionSlaRetryDue(attemptAt, now)
         ? [{ key: stageKey, attemptColumn: stageKey, firstManagerId: stageFirstManagerId }]
         : [];
@@ -1444,6 +1616,8 @@ export function createHeartbeatScheduling(
         const orgRows = companyAgents.map(toAgentOrgRow);
         let candidateId = stage.firstManagerId;
         let target: typeof agents.$inferSelect | null = null;
+        let fallbackTarget: typeof agents.$inferSelect | null = null;
+        let operationMatch: Awaited<ReturnType<typeof matchingCurrentOperation>> = null;
         const visited = new Set<string>();
         while (candidateId && !visited.has(candidateId)) {
           visited.add(candidateId);
@@ -1465,11 +1639,16 @@ export function createHeartbeatScheduling(
             .limit(1)
             .then((rows) => rows.length > 0);
           if (candidateCanReadIssue) {
-            target = candidate;
-            break;
+            fallbackTarget ??= candidate;
+            operationMatch = await matchingCurrentOperation(issue, candidate);
+            if (operationMatch) {
+              target = candidate;
+              break;
+            }
           }
           candidateId = candidate.reportsTo;
         }
+        target ??= fallbackTarget;
 
         if (!target) {
           skipped += 1;
@@ -1494,9 +1673,6 @@ export function createHeartbeatScheduling(
         // warning threshold or 45-minute breach threshold has been reached.
         // A manager wake remains useful when no exact, current operation proof
         // exists, but it is not an execution transfer or SLA completion.
-        const operationMatch = stage.key === "warning" || stage.key === "breach"
-          ? await matchingCurrentOperation(issue, target)
-          : null;
         if (operationMatch && issue.assigneeAgentId && target.id !== issue.assigneeAgentId) {
           const transferred = await db.transaction(async (tx) => {
             const [current] = await tx.select({
@@ -1511,6 +1687,11 @@ export function createHeartbeatScheduling(
             }).from(issues).where(and(
               eq(issues.id, issue.id),
               eq(issues.companyId, issue.companyId),
+              await issueReadSqlCondition(tx, {
+                type: "agent",
+                agentId: target.id,
+                companyId: issue.companyId,
+              }),
             )).for("update");
             if (!current || current.assigneeAgentId !== issue.assigneeAgentId ||
               current.projectWorkspaceId !== issue.projectWorkspaceId ||
@@ -1570,13 +1751,14 @@ export function createHeartbeatScheduling(
                 failedCallEventId: verifiedMatch.failed.id,
                 matchingSuccessfulCallEventId: verifiedMatch.success.id,
                 requestHash: verifiedMatch.failed.requestHash,
+                executionSlaDispatch: { status: "dispatching", attemptCount: 1, lastAttemptAt: now.toISOString() },
                 operationEvidenceScope: "exact tool operation only; not source objective completion or production acceptance",
               },
               nextAction: "Resume the original source issue using the verified operation capability; preserve its objective, independent acceptance, production gates, and return ownership.",
               lastAttemptAt: now,
               updatedAt: now,
-            }).returning({ id: issueRecoveryActions.id });
-            return action ? { id: action.id } : null;
+            }).returning({ id: issueRecoveryActions.id, evidence: issueRecoveryActions.evidence });
+            return action ? { id: action.id, evidence: action.evidence } : null;
           });
           if (transferred) {
             const idempotencyWindow = Math.floor(now.getTime() / (5 * 60 * 1000));
@@ -1620,6 +1802,24 @@ export function createHeartbeatScheduling(
               .limit(1)
               .then((rows) => rows[0] ?? null);
             const transferWakeAccepted = Boolean(durableTransferWake && !["failed", "cancelled", "skipped"].includes(durableTransferWake.status));
+            await db.update(issueRecoveryActions).set({
+              evidence: {
+                ...transferred.evidence,
+                executionSlaDispatch: {
+                  status: transferWakeAccepted ? "queued" : "pending",
+                  attemptCount: 1,
+                  lastAttemptAt: now.toISOString(),
+                  wakeRequestId: durableTransferWake?.id ?? null,
+                  wakeStatus: durableTransferWake?.status ?? null,
+                  lastError: transferWakeError,
+                },
+              },
+              updatedAt: now,
+            }).where(and(
+              eq(issueRecoveryActions.id, transferred.id),
+              eq(issueRecoveryActions.companyId, issue.companyId),
+              inArray(issueRecoveryActions.status, ["active", "escalated"]),
+            ));
             if (transferWakeAccepted) {
               enqueued += 1;
               if (stage.key === "warning") {
