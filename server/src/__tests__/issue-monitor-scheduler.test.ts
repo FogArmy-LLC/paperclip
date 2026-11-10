@@ -405,6 +405,33 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       (row.details as Record<string, unknown>).correctiveOutcomeAccepted === false)).toBe(true);
   });
 
+  it("dispatches a large overdue batch without exceeding the wake receipt index key limit", async () => {
+    const firstIdentifiedAt = new Date("2026-04-11T12:00:00.000Z");
+    const seeded = await seedFixture({ executionSlaEnabled: true, issueStatus: "blocked", createdAt: firstIdentifiedAt, withManager: true,
+      monitor: { nextCheckAt: "2027-04-11T12:30:00.000Z" } });
+    await db.insert(issues).values(Array.from({ length: 199 }, (_, index) => ({
+      id: randomUUID(), companyId: seeded.companyId, title: `Overdue batch member ${index}`,
+      status: "blocked", assigneeAgentId: seeded.agentId, createdAt: firstIdentifiedAt,
+      executionSlaFirstIdentifiedAt: firstIdentifiedAt,
+    })));
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:45:00.000Z"));
+    const requests = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seeded.companyId));
+    const events = await db.select().from(activityLog).where(and(eq(activityLog.companyId, seeded.companyId), eq(activityLog.action, "issue.execution_sla_breach_dispatch_failed")));
+    expect(events.slice(0, 1).map(row => row.details)).toEqual([]);
+    const dispatched = requests.filter(row => row.reason === "critical_execution_sla_breach");
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]!.idempotencyKey!.length).toBeLessThan(256);
+    const issueIds = dispatched[0]!.payload?.issueIds as string[];
+    expect(issueIds).toHaveLength(100); // scheduler's existing bounded page
+    expect(new Set(issueIds).size).toBe(100);
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:45:00.000Z"));
+    const receipts = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seeded.companyId));
+    const batches = receipts.filter(row => row.reason === "critical_execution_sla_breach");
+    expect(batches).toHaveLength(2); // next tick advances to the remaining page
+    expect(new Set(batches.flatMap(row => row.payload?.issueIds as string[])).size).toBe(200);
+    expect(batches.every(row => row.idempotencyKey!.length < 256)).toBe(true);
+  });
+
   it("keeps execution SLA opt-in and excludes terminal or cross-company issues", async () => {
     const firstIdentifiedAt = new Date("2026-04-11T12:00:00.000Z");
     const enabled = await seedFixture({ executionSlaEnabled: true, issueStatus: "blocked", createdAt: firstIdentifiedAt, withManager: true, monitor: { nextCheckAt: "2027-04-11T12:30:00.000Z" } });
