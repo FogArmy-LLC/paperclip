@@ -5,7 +5,7 @@ import { createNativeToolTrace } from "./native-tool-trace.js";
 function fixture() {
   let now = 1_000;
   const spans: Record<string, unknown>[] = [];
-  const trace = createNativeRunTrace({ runId: "test", startedAtMs: 1_000, onEvent: async (event) => { spans.push(event.payload as Record<string, unknown>); } });
+  const trace = createNativeRunTrace({ companyId: "company-a", runId: "test", startedAtMs: 1_000, onEvent: async (event) => { spans.push(event.payload as Record<string, unknown>); } });
   trace.start("agent.turn");
   return { spans, timing: createNativeToolTrace(trace, () => now), at: (time: number) => { now = time; } };
 }

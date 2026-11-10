@@ -3197,6 +3197,7 @@ export function heartbeatService(
         } catch (error) {
           if (agent.adapterType === "paperclip_runner") {
             await recordFailedSkillPreparation({
+              companyId: agent.companyId,
               runId: run.id,
               startedAtMs: skillsPrepareStartedAtMs,
               onEvent: async (event) => {
