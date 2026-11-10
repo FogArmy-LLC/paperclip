@@ -9,7 +9,7 @@ import { mergeRunLogChunks, readChunkSeq } from "../lib/run-log-chunks";
 import { getPageVisibility, usePageVisibility } from "../lib/page-visibility";
 import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { useParams, useNavigate, Link, Navigate, useBeforeUnload, type NavigateFunction } from "@/lib/router";
-import { useQuery, useMutation, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useMutation, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import {
   agentsApi,
   type AgentKey,
@@ -357,6 +357,12 @@ function usageNumber(usage: Record<string, unknown> | null, ...keys: string[]) {
   return 0;
 }
 
+function finiteRunScalar(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
+  return 0;
+}
+
 function setsEqual<T>(left: Set<T>, right: Set<T>) {
   if (left.size !== right.size) return false;
   for (const value of left) {
@@ -368,16 +374,16 @@ function setsEqual<T>(left: Set<T>, right: Set<T>) {
 function runMetrics(run: HeartbeatRun) {
   const usage = (run.usageJson ?? null) as Record<string, unknown> | null;
   const result = (run.resultJson ?? null) as Record<string, unknown> | null;
-  const input = usageNumber(usage, "inputTokens", "input_tokens");
-  const output = usageNumber(usage, "outputTokens", "output_tokens");
+  const input = usageNumber(usage, "inputTokens", "input_tokens") || finiteRunScalar(run.inputTokens);
+  const output = usageNumber(usage, "outputTokens", "output_tokens") || finiteRunScalar(run.outputTokens);
   const cached = usageNumber(
     usage,
     "cachedInputTokens",
     "cached_input_tokens",
     "cache_read_input_tokens",
-  );
+  ) || finiteRunScalar(run.cachedInputTokens);
   const cost =
-    visibleRunCostUsd(usage, result);
+    visibleRunCostUsd(usage, result) || finiteRunScalar(run.costUsd);
   const provider = asNonEmptyString(usage?.provider) ?? null;
   const model = asNonEmptyString(usage?.model) ?? null;
   return {
@@ -385,7 +391,7 @@ function runMetrics(run: HeartbeatRun) {
     output,
     cached,
     cost,
-    totalTokens: visibleRunTokenTotal(usage),
+    totalTokens: visibleRunTokenTotal(usage) || finiteRunScalar(run.totalTokens),
     provider,
     model,
   };
@@ -791,8 +797,6 @@ export function AgentDetail() {
               ? "configuration"
               : activeView;
   const needsOverviewData = activeView === "overview";
-  const needsRunData = activeView === "run-detail";
-  const shouldLoadHeartbeats = needsOverviewData || needsRunData;
   const [configDirty, setConfigDirty] = useState(false);
   const [configSaving, setConfigSaving] = useState(false);
   const saveConfigActionRef = useRef<(() => void) | null>(null);
@@ -920,9 +924,9 @@ export function AgentDetail() {
   });
 
   const { data: heartbeats } = useQuery({
-    queryKey: queryKeys.heartbeats(resolvedCompanyId!, agent?.id ?? undefined),
-    queryFn: () => heartbeatsApi.list(resolvedCompanyId!, agent?.id ?? undefined),
-    enabled: !!resolvedCompanyId && !!agent?.id && shouldLoadHeartbeats,
+    queryKey: [...queryKeys.heartbeats(resolvedCompanyId!, agent?.id ?? undefined), "overview"],
+    queryFn: () => heartbeatsApi.list(resolvedCompanyId!, agent?.id ?? undefined, 20, { compact: true }),
+    enabled: !!resolvedCompanyId && !!agent?.id && needsOverviewData,
   });
 
   const { data: allIssues } = useQuery({
@@ -1496,7 +1500,6 @@ export function AgentDetail() {
 
       {activeView === "run-detail" && (
         <RunsTab
-          runs={heartbeats ?? []}
           companyId={resolvedCompanyId!}
           agentId={agent.id}
           agentRouteId={canonicalAgentRef}
@@ -3298,8 +3301,9 @@ function RunListItem({ run, isSelected, agentId }: { run: HeartbeatRun; isSelect
   );
 }
 
+const AGENT_RUN_HISTORY_PAGE_SIZE = 50;
+
 function RunsTab({
-  runs,
   companyId,
   agentId,
   agentRouteId,
@@ -3307,7 +3311,6 @@ function RunsTab({
   adapterType,
   adapterConfig,
 }: {
-  runs: HeartbeatRun[];
   companyId: string;
   agentId: string;
   agentRouteId: string;
@@ -3316,8 +3319,37 @@ function RunsTab({
   adapterConfig: Record<string, unknown>;
 }) {
   const { isMobile } = useSidebar();
+  const history = useInfiniteQuery({
+    queryKey: [...queryKeys.heartbeats(companyId, agentId), "agent-history", AGENT_RUN_HISTORY_PAGE_SIZE],
+    queryFn: ({ pageParam }) =>
+      heartbeatsApi.list(companyId, agentId, AGENT_RUN_HISTORY_PAGE_SIZE, {
+        compact: true,
+        offset: pageParam,
+      }),
+    enabled: Boolean(companyId && agentId),
+    initialPageParam: 0,
+    getNextPageParam: (lastPage, _pages, lastOffset) =>
+      lastPage.length === AGENT_RUN_HISTORY_PAGE_SIZE
+        ? lastOffset + AGENT_RUN_HISTORY_PAGE_SIZE
+        : undefined,
+  });
+  const runs = history.data?.pages.flat() ?? [];
+  const selectedRunIsLoaded = selectedRunId ? runs.some((run) => run.id === selectedRunId) : false;
+  const selectedRunQuery = useQuery({
+    queryKey: queryKeys.runDetail(selectedRunId ?? "__none__"),
+    queryFn: () => heartbeatsApi.get(selectedRunId!),
+    enabled: Boolean(selectedRunId && !selectedRunIsLoaded),
+  });
 
-  if (runs.length === 0) {
+  if (history.isLoading) {
+    return <p className="text-sm text-muted-foreground">Loading runs…</p>;
+  }
+
+  if (selectedRunId && !selectedRun && selectedRunQuery.isLoading) {
+    return <p className="text-sm text-muted-foreground">Loading selected run…</p>;
+  }
+
+  if (runs.length === 0 && !selectedRunQuery.data) {
     return <p className="text-sm text-muted-foreground">No runs yet.</p>;
   }
 
@@ -3328,7 +3360,8 @@ function RunsTab({
 
   // On mobile, don't auto-select so the list shows first; on desktop, auto-select latest
   const effectiveRunId = isMobile ? selectedRunId : (selectedRunId ?? sorted[0]?.id ?? null);
-  const selectedRun = sorted.find((r) => r.id === effectiveRunId) ?? null;
+  const selectedRun = sorted.find((r) => r.id === effectiveRunId)
+    ?? (selectedRunQuery.data?.id === effectiveRunId ? selectedRunQuery.data : null);
 
   // Mobile: show either run list OR run detail with back button
   if (isMobile) {
@@ -3351,6 +3384,7 @@ function RunsTab({
         {sorted.map((run) => (
           <RunListItem key={run.id} run={run} isSelected={false} agentId={agentRouteId} />
         ))}
+        <LoadOlderRuns history={history} />
       </div>
     );
   }
@@ -3367,6 +3401,7 @@ function RunsTab({
         {sorted.map((run) => (
           <RunListItem key={run.id} run={run} isSelected={run.id === effectiveRunId} agentId={agentRouteId} />
         ))}
+        <LoadOlderRuns history={history} />
         </div>
       </div>
 
@@ -3376,6 +3411,29 @@ function RunsTab({
           <RunDetail key={selectedRun.id} run={selectedRun} agentRouteId={agentRouteId} adapterType={adapterType} adapterConfig={adapterConfig} />
         </div>
       )}
+    </div>
+  );
+}
+
+function LoadOlderRuns({ history }: {
+  history: {
+    hasNextPage: boolean | undefined;
+    isFetchingNextPage: boolean;
+    fetchNextPage: () => Promise<unknown>;
+  };
+}) {
+  if (!history.hasNextPage && !history.isFetchingNextPage) return null;
+  return (
+    <div className="flex justify-center border-t border-border p-2">
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        disabled={history.isFetchingNextPage}
+        onClick={() => void history.fetchNextPage()}
+      >
+        {history.isFetchingNextPage ? "Loading older runs…" : "Load older runs"}
+      </Button>
     </div>
   );
 }

@@ -176,6 +176,19 @@ const heartbeatRunListResultColumns = {
   >`${heartbeatRuns.resultJson} ->> 'costUsd'`.as("resultCostUsdCamel"),
 } as const;
 
+// Agent run history uses this small projection for its paged list. Keep the
+// visible one-line summary and source-resolution badge without loading the
+// transcript, full usage payload, session internals, or process metadata.
+const heartbeatRunCompactListColumns = {
+  ...heartbeatRunSummaryListColumns,
+  ...heartbeatRunListResultColumns,
+  foldSourceIssueId: sql<string | null>`${heartbeatRuns.resultJson} #>> '{sourceResolvedWatchdogFold,sourceIssueId}'`.as("foldSourceIssueId"),
+  foldSourceIssueStatus: sql<string | null>`${heartbeatRuns.resultJson} #>> '{sourceResolvedWatchdogFold,sourceIssueStatus}'`.as("foldSourceIssueStatus"),
+  foldEvidenceKind: sql<string | null>`${heartbeatRuns.resultJson} #>> '{sourceResolvedWatchdogFold,sameRunEvidenceKind}'`.as("foldEvidenceKind"),
+  foldEvidenceId: sql<string | null>`${heartbeatRuns.resultJson} #>> '{sourceResolvedWatchdogFold,sameRunEvidenceId}'`.as("foldEvidenceId"),
+  foldEvidenceAt: sql<string | null>`${heartbeatRuns.resultJson} #>> '{sourceResolvedWatchdogFold,sameRunEvidenceAt}'`.as("foldEvidenceAt"),
+} as const;
+
 // Reserve at most 9 KiB for diagnostics in the reduced result. An oversized
 // multibyte field uses a conservative four-byte-per-character prefix, with a
 // visible pointer to the full (adapter-bounded) run error and transcript.
@@ -1668,14 +1681,21 @@ export function createHeartbeatRunState(db: Db) {
       companyId: string,
       agentId?: string,
       limit?: number,
-      options: { summary?: boolean } = {},
+      options: { summary?: boolean; compact?: boolean; offset?: number } = {},
     ) => {
       const safeForLegacyEncoding = await hasUnsafeTextProjectionDatabase();
       const summary = options.summary === true;
+      const compact = options.compact === true;
+      const offset = Math.max(0, options.offset ?? 0);
       const rows = await retryIdempotentDatabaseOperation(async () => {
         const query = db
           .select(
-            summary
+            compact && !safeForLegacyEncoding
+              ? {
+                  ...heartbeatRunCompactListColumns,
+                  ...heartbeatRunListContextColumns,
+                }
+              : summary
               ? {
                   ...heartbeatRunSummaryListColumns,
                   ...heartbeatRunListContextColumns,
@@ -1701,9 +1721,10 @@ export function createHeartbeatRunState(db: Db) {
                 )
               : eq(heartbeatRuns.companyId, companyId),
           )
-          .orderBy(desc(heartbeatRuns.createdAt));
+          .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
 
-        return limit ? await query.limit(limit) : await query;
+        if (limit) return await query.limit(limit).offset(offset);
+        return offset > 0 ? await query.offset(offset) : await query;
       });
       return rows.map((row) => {
         const {
@@ -1722,6 +1743,11 @@ export function createHeartbeatRunState(db: Db) {
           resultTotalCostUsd,
           resultCostUsd,
           resultCostUsdCamel,
+          foldSourceIssueId,
+          foldSourceIssueStatus,
+          foldEvidenceKind,
+          foldEvidenceId,
+          foldEvidenceAt,
           ...rest
         } = row as typeof row & {
           resultSummary?: string | null;
@@ -1731,7 +1757,34 @@ export function createHeartbeatRunState(db: Db) {
           resultTotalCostUsd?: string | null;
           resultCostUsd?: string | null;
           resultCostUsdCamel?: string | null;
+          foldSourceIssueId?: string | null;
+          foldSourceIssueStatus?: string | null;
+          foldEvidenceKind?: string | null;
+          foldEvidenceId?: string | null;
+          foldEvidenceAt?: string | null;
         };
+
+        const compactResult = compact
+          ? summarizeHeartbeatRunListResultJson({
+              summary: resultSummary,
+              result: resultResult,
+              message: resultMessage,
+              error: resultError,
+              totalCostUsd: resultTotalCostUsd,
+              costUsd: resultCostUsd,
+              costUsdCamel: resultCostUsdCamel,
+            })
+          : null;
+        const sourceResolvedWatchdogFold =
+          foldSourceIssueId && foldSourceIssueStatus && foldEvidenceKind && foldEvidenceId && foldEvidenceAt
+            ? {
+                sourceIssueId: foldSourceIssueId,
+                sourceIssueStatus: foldSourceIssueStatus,
+                sameRunEvidenceKind: foldEvidenceKind,
+                sameRunEvidenceId: foldEvidenceId,
+                sameRunEvidenceAt: foldEvidenceAt,
+              }
+            : null;
 
         return {
           ...rest,
@@ -1746,17 +1799,24 @@ export function createHeartbeatRunState(db: Db) {
             wakeTriggerDetail: contextWakeTriggerDetail,
           }),
           resultJson:
-            safeForLegacyEncoding || summary
+            safeForLegacyEncoding || (summary && !compact)
               ? null
-              : summarizeHeartbeatRunListResultJson({
-                  summary: resultSummary,
-                  result: resultResult,
-                  message: resultMessage,
-                  error: resultError,
-                  totalCostUsd: resultTotalCostUsd,
-                  costUsd: resultCostUsd,
-                  costUsdCamel: resultCostUsdCamel,
-                }),
+              : compact
+                ? compactResult || sourceResolvedWatchdogFold
+                  ? {
+                      ...(compactResult ?? {}),
+                      ...(sourceResolvedWatchdogFold ? { sourceResolvedWatchdogFold } : {}),
+                    }
+                  : null
+                : summarizeHeartbeatRunListResultJson({
+                    summary: resultSummary,
+                    result: resultResult,
+                    message: resultMessage,
+                    error: resultError,
+                    totalCostUsd: resultTotalCostUsd,
+                    costUsd: resultCostUsd,
+                    costUsdCamel: resultCostUsdCamel,
+                  }),
         };
       });
     },
