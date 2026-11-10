@@ -104,7 +104,7 @@ describePostgres("heartbeat run state database wiring", () => {
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("heartbeat-run-state-");
     db = createDb(database.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterAll(async () => {
     await database?.cleanup();

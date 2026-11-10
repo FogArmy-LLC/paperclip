@@ -68,14 +68,14 @@ const heartbeatRunListColumns = {
   invocationSource: heartbeatRuns.invocationSource,
   triggerDetail: heartbeatRuns.triggerDetail,
   status: heartbeatRuns.status,
-  inputTokens: sql<number | null>`(${heartbeatRuns.usageJson} ->> 'inputTokens')::numeric`.as("inputTokens"),
-  cachedInputTokens: sql<number | null>`(${heartbeatRuns.usageJson} ->> 'cachedInputTokens')::numeric`.as("cachedInputTokens"),
-  outputTokens: sql<number | null>`(${heartbeatRuns.usageJson} ->> 'outputTokens')::numeric`.as("outputTokens"),
-  totalTokens: sql<number | null>`(${heartbeatRuns.usageJson} ->> 'totalTokens')::numeric`.as("totalTokens"),
+  inputTokens: sql<number | null>`(${heartbeatRuns.usageJson} ->> 'inputTokens')::double precision`.as("inputTokens"),
+  cachedInputTokens: sql<number | null>`(${heartbeatRuns.usageJson} ->> 'cachedInputTokens')::double precision`.as("cachedInputTokens"),
+  outputTokens: sql<number | null>`(${heartbeatRuns.usageJson} ->> 'outputTokens')::double precision`.as("outputTokens"),
+  totalTokens: sql<number | null>`(${heartbeatRuns.usageJson} ->> 'totalTokens')::double precision`.as("totalTokens"),
   costUsd: sql<number | null>`coalesce(
-    (${heartbeatRuns.resultJson} ->> 'costUsd')::numeric,
-    (${heartbeatRuns.resultJson} ->> 'cost_usd')::numeric,
-    (${heartbeatRuns.resultJson} ->> 'total_cost_usd')::numeric
+    (${heartbeatRuns.resultJson} ->> 'costUsd')::double precision,
+    (${heartbeatRuns.resultJson} ->> 'cost_usd')::double precision,
+    (${heartbeatRuns.resultJson} ->> 'total_cost_usd')::double precision
   )`.as("costUsd"),
   startedAt: heartbeatRuns.startedAt,
   finishedAt: heartbeatRuns.finishedAt,

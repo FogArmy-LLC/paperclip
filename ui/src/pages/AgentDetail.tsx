@@ -372,16 +372,22 @@ function setsEqual<T>(left: Set<T>, right: Set<T>) {
 }
 
 function runMetrics(run: HeartbeatRun) {
+  const scalarRun = run as HeartbeatRun & {
+    inputTokens?: unknown;
+    cachedInputTokens?: unknown;
+    outputTokens?: unknown;
+    totalTokens?: unknown;
+  };
   const usage = (run.usageJson ?? null) as Record<string, unknown> | null;
   const result = (run.resultJson ?? null) as Record<string, unknown> | null;
-  const input = usageNumber(usage, "inputTokens", "input_tokens") || finiteRunScalar(run.inputTokens);
-  const output = usageNumber(usage, "outputTokens", "output_tokens") || finiteRunScalar(run.outputTokens);
+  const input = usageNumber(usage, "inputTokens", "input_tokens") || finiteRunScalar(scalarRun.inputTokens);
+  const output = usageNumber(usage, "outputTokens", "output_tokens") || finiteRunScalar(scalarRun.outputTokens);
   const cached = usageNumber(
     usage,
     "cachedInputTokens",
     "cached_input_tokens",
     "cache_read_input_tokens",
-  ) || finiteRunScalar(run.cachedInputTokens);
+  ) || finiteRunScalar(scalarRun.cachedInputTokens);
   const cost =
     visibleRunCostUsd(usage, result) || finiteRunScalar(run.costUsd);
   const provider = asNonEmptyString(usage?.provider) ?? null;
@@ -391,7 +397,7 @@ function runMetrics(run: HeartbeatRun) {
     output,
     cached,
     cost,
-    totalTokens: visibleRunTokenTotal(usage) || finiteRunScalar(run.totalTokens),
+    totalTokens: visibleRunTokenTotal(usage) || finiteRunScalar(scalarRun.totalTokens),
     provider,
     model,
   };
@@ -3340,6 +3346,14 @@ function RunsTab({
     queryFn: () => heartbeatsApi.get(selectedRunId!),
     enabled: Boolean(selectedRunId && !selectedRunIsLoaded),
   });
+  // Sort by created descending.
+  const sorted = [...runs].sort(
+    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+  );
+  // On mobile, don't auto-select so the list shows first; on desktop, auto-select latest.
+  const effectiveRunId = isMobile ? selectedRunId : (selectedRunId ?? sorted[0]?.id ?? null);
+  const selectedRun = sorted.find((r) => r.id === effectiveRunId)
+    ?? (selectedRunQuery.data?.id === effectiveRunId ? selectedRunQuery.data : null);
 
   if (history.isLoading) {
     return <p className="text-sm text-muted-foreground">Loading runs…</p>;
@@ -3352,16 +3366,6 @@ function RunsTab({
   if (runs.length === 0 && !selectedRunQuery.data) {
     return <p className="text-sm text-muted-foreground">No runs yet.</p>;
   }
-
-  // Sort by created descending
-  const sorted = [...runs].sort(
-    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-  );
-
-  // On mobile, don't auto-select so the list shows first; on desktop, auto-select latest
-  const effectiveRunId = isMobile ? selectedRunId : (selectedRunId ?? sorted[0]?.id ?? null);
-  const selectedRun = sorted.find((r) => r.id === effectiveRunId)
-    ?? (selectedRunQuery.data?.id === effectiveRunId ? selectedRunQuery.data : null);
 
   // Mobile: show either run list OR run detail with back button
   if (isMobile) {
