@@ -64,7 +64,7 @@
             }
           ],
           "isUnique": false,
-          "concurrently": false,
+          "concurrently": true,
           "method": "btree",
           "with": {}
         }
@@ -3826,7 +3826,7 @@
           ],
           "isUnique": true,
           "where": "\"agent_wakeup_requests\".\"idempotency_key\" LIKE 'execution-sla:%'",
-          "concurrently": false,
+          "concurrently": true,
           "method": "btree",
           "with": {}
         },

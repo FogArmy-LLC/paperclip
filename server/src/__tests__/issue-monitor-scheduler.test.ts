@@ -130,6 +130,8 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(companySkills);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
     await db.delete(companies);
   }
 
@@ -336,6 +338,13 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(warningWake[0]?.reason).toBe("critical_execution_sla_warning");
     expect(warningWake[0]?.idempotencyKey).toContain(`execution-sla:${companyId}:${managerId}:warning:`);
     expect(warningWake[0]?.payload).toMatchObject({ issueIds: [issueId] });
+    await waitForHeartbeatIdle();
+    await db.update(agentWakeupRequests).set({
+      status: "failed",
+      error: "Injected missed warning handoff",
+      requestedAt: new Date("2026-04-11T12:30:00.000Z"),
+      finishedAt: new Date("2026-04-11T12:30:01.000Z"),
+    }).where(eq(agentWakeupRequests.id, warningWake[0]!.id));
 
     // Repeating the scheduler tick cannot duplicate the warning or reset the clock.
     await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
@@ -449,7 +458,12 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await waitForHeartbeatIdle();
     const [firstWake] = await db.select().from(agentWakeupRequests)
       .where(sql`${agentWakeupRequests.companyId} = ${seeded.companyId} and ${agentWakeupRequests.reason} = 'issue_assigned'`);
-    await db.update(agentWakeupRequests).set({ status: "failed", error: "Injected dispatch failure" })
+    await db.update(agentWakeupRequests).set({
+      status: "failed",
+      error: "Injected dispatch failure",
+      requestedAt: new Date("2026-04-11T12:30:00.000Z"),
+      finishedAt: new Date("2026-04-11T12:30:01.000Z"),
+    })
       .where(eq(agentWakeupRequests.id, firstWake!.id));
     await heartbeatService(db).tickTimers(new Date("2026-04-11T12:36:00.000Z"));
     const retriedWakes = await db.select().from(agentWakeupRequests)
@@ -460,6 +474,16 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(retryWake?.idempotencyKey).not.toBe(firstWake?.idempotencyKey);
     const [recovery] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, seeded.issueId));
     expect(recovery?.evidence.executionSlaDispatch).toMatchObject({ status: "queued", wakeRequestId: retryWake!.id });
+
+    await waitForHeartbeatIdle();
+    await db.update(agentWakeupRequests).set({ requestedAt: new Date("2026-04-11T12:36:00.000Z"), claimedAt: null })
+      .where(eq(agentWakeupRequests.id, retryWake!.id));
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:42:00.000Z"));
+    const reconciledWakes = await db.select().from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.companyId} = ${seeded.companyId} and ${agentWakeupRequests.reason} = 'issue_assigned'`);
+    expect(reconciledWakes).toHaveLength(3);
+    expect(reconciledWakes.find((row) => row.id === retryWake!.id)?.status).toBe("failed");
+    expect(reconciledWakes.some((row) => row.id !== retryWake!.id && row.id !== firstWake!.id)).toBe(true);
   });
 
   it("records an unavailable manager, preserves the original deadline, and retries after capability recovery", async () => {

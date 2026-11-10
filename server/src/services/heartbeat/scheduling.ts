@@ -1422,14 +1422,25 @@ export function createHeartbeatScheduling(
       const dispatch = parseObject(pending.evidence.executionSlaDispatch);
       let dispatchStatus = readNonEmptyString(dispatch.status);
       if (dispatchStatus === "queued" && typeof dispatch.wakeRequestId === "string") {
-        const [previousWake] = await db.select({ status: agentWakeupRequests.status }).from(agentWakeupRequests)
+        const [previousWake] = await db.select({
+          status: agentWakeupRequests.status,
+          requestedAt: agentWakeupRequests.requestedAt,
+          claimedAt: agentWakeupRequests.claimedAt,
+        }).from(agentWakeupRequests)
           .where(and(eq(agentWakeupRequests.id, dispatch.wakeRequestId), eq(agentWakeupRequests.companyId, pending.companyId)))
           .limit(1);
-        if (!previousWake || ["failed", "cancelled", "skipped"].includes(previousWake.status)) dispatchStatus = "pending";
+        if (!previousWake || ["failed", "cancelled", "skipped"].includes(previousWake.status)) {
+          dispatchStatus = "pending";
+        } else {
+          const wakeAgeFrom = previousWake.claimedAt ?? previousWake.requestedAt;
+          if (wakeAgeFrom.getTime() <= retryCutoff.getTime() && !activeIssueIds.has(pending.sourceIssueId)) {
+            dispatchStatus = "pending";
+          }
+        }
       }
       const lastAttemptAt = pending.lastAttemptAt
         ?? (typeof dispatch.lastAttemptAt === "string" ? new Date(dispatch.lastAttemptAt) : null);
-      if (!ownerId || dispatchStatus === "queued" ||
+      if (!ownerId || dispatchStatus === "queued" || activeIssueIds.has(pending.sourceIssueId) || pendingWakeIssueIds.has(pending.sourceIssueId) ||
         (lastAttemptAt && lastAttemptAt.getTime() > retryCutoff.getTime()) ||
         activeIssueIds.has(pending.sourceIssueId) || pendingWakeIssueIds.has(pending.sourceIssueId)) continue;
       const owner = agentById.get(ownerId);
@@ -1450,10 +1461,40 @@ export function createHeartbeatScheduling(
         const currentDispatch = parseObject(action.evidence.executionSlaDispatch);
         const currentStatus = readNonEmptyString(currentDispatch.status);
         if (currentStatus === "queued" && typeof currentDispatch.wakeRequestId === "string") {
-          const [previousWake] = await tx.select({ status: agentWakeupRequests.status }).from(agentWakeupRequests)
+          const [previousWake] = await tx.select({
+            id: agentWakeupRequests.id,
+            status: agentWakeupRequests.status,
+            requestedAt: agentWakeupRequests.requestedAt,
+            claimedAt: agentWakeupRequests.claimedAt,
+          }).from(agentWakeupRequests)
             .where(and(eq(agentWakeupRequests.id, currentDispatch.wakeRequestId), eq(agentWakeupRequests.companyId, pending.companyId)))
+            .for("update")
             .limit(1);
-          if (previousWake && !["failed", "cancelled", "skipped"].includes(previousWake.status)) return null;
+          if (previousWake && !["failed", "cancelled", "skipped"].includes(previousWake.status)) {
+            const wakeAgeFrom = previousWake.claimedAt ?? previousWake.requestedAt;
+            if (wakeAgeFrom.getTime() > retryCutoff.getTime()) return null;
+            const [activeRun] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, pending.companyId),
+              inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+              or(eq(heartbeatRuns.nativeIssueId, pending.sourceIssueId), eq(heartbeatRuns.issueId, pending.sourceIssueId)),
+            )).limit(1);
+            const [activeOperation] = await tx.select({ id: workspaceOperations.id }).from(workspaceOperations).where(and(
+              eq(workspaceOperations.companyId, pending.companyId),
+              eq(workspaceOperations.issueId, pending.sourceIssueId),
+              eq(workspaceOperations.status, "running"),
+            )).limit(1);
+            if (activeRun || activeOperation) return null;
+            await tx.update(agentWakeupRequests).set({
+              status: "failed",
+              error: "Execution SLA takeover wake exceeded its bounded queue age without an active issue run.",
+              finishedAt: now,
+              updatedAt: now,
+            }).where(and(
+              eq(agentWakeupRequests.id, previousWake.id),
+              eq(agentWakeupRequests.companyId, pending.companyId),
+              inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+            ));
+          }
         } else if (currentStatus === "queued") {
           return null;
         }

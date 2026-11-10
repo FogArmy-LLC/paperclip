@@ -138,6 +138,7 @@ const KIND_LABEL: Record<IssueRecoveryActionKind, string> = {
   configuration_validation: "Configuration Validation",
   active_run_watchdog: "Active Watchdog",
   issue_graph_liveness: "Task Needs Next Step",
+  execution_sla_takeover: "Emergency Execution Handoff",
 };
 
 const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
@@ -155,6 +156,8 @@ const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
     "The active run has been silent. Recovery is observing without interrupting it.",
   issue_graph_liveness:
     "Paperclip could not find a clear next step for this open task. Choose whether to continue work, send it for review, mark it done, or record what is blocking it.",
+  execution_sla_takeover:
+    "This task reached its execution SLA threshold. Paperclip handed the blocked work to a verified capable teammate while preserving the original owner and return path.",
 };
 
 /** Shared shell for the retry-timing pill so every timing state reads as the same control. */
