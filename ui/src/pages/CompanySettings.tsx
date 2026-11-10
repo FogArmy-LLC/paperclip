@@ -89,6 +89,14 @@ export function CompanySettings() {
     }
   });
 
+  const executionSlaMutation = useMutation({
+    mutationFn: (enabled: boolean) =>
+      companiesApi.update(selectedCompanyId!, { executionSlaEnabled: enabled }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+    },
+  });
+
   const governanceMutation = useMutation({
     mutationFn: (next: InteractionResolverGovernance) =>
       companiesApi.update(selectedCompanyId!, { interactionResolverGovernance: next }),
@@ -354,6 +362,29 @@ export function CompanySettings() {
             onChange={(v) => settingsMutation.mutate(v)}
             toggleTestId="company-settings-team-approval-toggle"
           />
+        </div>
+      </div>
+
+      {/* Execution SLA is company-scoped and remains off unless an operator enables it. */}
+      <div className="max-w-2xl space-y-4" data-testid="company-settings-execution-sla-section">
+        <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+          Execution reliability
+        </div>
+        <div>
+          <ToggleField
+            label="Enable 30/45-minute execution SLA escalation"
+            hint="Escalates overdue blocked work through this company's reporting chain and may transfer it only to a verified capable executor. This does not count a notification as resolution or replace independent acceptance and production proof."
+            checked={selectedCompany.executionSlaEnabled}
+            onChange={(enabled) => executionSlaMutation.mutate(enabled)}
+            toggleTestId="company-settings-execution-sla-toggle"
+          />
+          {executionSlaMutation.isError && (
+            <p className="mt-2 text-xs text-destructive" role="alert">
+              {executionSlaMutation.error instanceof Error
+                ? executionSlaMutation.error.message
+                : "Failed to update execution SLA setting"}
+            </p>
+          )}
         </div>
       </div>
 
