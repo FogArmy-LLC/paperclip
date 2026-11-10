@@ -35,6 +35,7 @@ function readingDatabase(serverEncoding: string, ...results: unknown[][]) {
       },
       orderBy: () => query,
       limit: () => query,
+      offset: () => query,
       then: (resolve: (rows: unknown[]) => unknown) => Promise.resolve(rows).then(resolve),
     };
     return query;
@@ -103,7 +104,7 @@ describePostgres("heartbeat run state database wiring", () => {
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("heartbeat-run-state-");
     db = createDb(database.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterAll(async () => {
     await database?.cleanup();
@@ -145,6 +146,61 @@ describePostgres("heartbeat run state database wiring", () => {
       companyId, sessionDisplayId: "our-session", sessionParamsJson: { sessionId: "our-session" },
     });
     expect((await state.listRuns(companyId)).map((row) => row.id)).toEqual([run.id]);
+  });
+
+  it("pages compact run history while retaining the row summary and resolution badge", async () => {
+    const { companyId, agent, state } = await fixture();
+    const baseTime = new Date("2026-02-01T00:00:00.000Z");
+    const runs = await db.insert(heartbeatRuns).values([
+      {
+        companyId, agentId: agent.id, invocationSource: "assignment",
+        createdAt: new Date(baseTime.getTime() + 2_000),
+        usageJson: { inputTokens: 12, cachedInputTokens: 3, outputTokens: 5, totalTokens: 17 },
+        resultJson: { summary: "newer summary", providerPrivateData: "must not be selected" },
+      },
+      {
+        companyId, agentId: agent.id, invocationSource: "timer",
+        createdAt: new Date(baseTime.getTime() + 1_000),
+        usageJson: { inputTokens: 20, outputTokens: 8, totalTokens: 28 },
+        resultJson: {
+          summary: "older summary",
+          sourceResolvedWatchdogFold: {
+            sourceIssueId: "source-issue",
+            sourceIssueStatus: "done",
+            sameRunEvidenceKind: "comment",
+            sameRunEvidenceId: "evidence-1",
+            sameRunEvidenceAt: "2026-02-01T00:00:00.000Z",
+            cleanup: { error: "large diagnostic should not be in list" },
+          },
+        },
+      },
+      {
+        companyId, agentId: agent.id, invocationSource: "on_demand",
+        createdAt: baseTime,
+        resultJson: { summary: "oldest summary" },
+      },
+    ]).returning();
+
+    const secondPage = await state.listRuns(companyId, agent.id, 2, { compact: true, offset: 1 });
+    expect(secondPage.map((run) => run.id)).toEqual([runs[1].id, runs[2].id]);
+    expect(secondPage[0]).toMatchObject({
+      inputTokens: 20,
+      outputTokens: 8,
+      totalTokens: 28,
+      resultJson: {
+        summary: "older summary",
+        sourceResolvedWatchdogFold: {
+          sourceIssueId: "source-issue",
+          sourceIssueStatus: "done",
+          sameRunEvidenceKind: "comment",
+          sameRunEvidenceId: "evidence-1",
+        },
+      },
+      usageJson: null,
+      sessionIdAfter: null,
+    });
+    expect(JSON.stringify(secondPage)).not.toContain("large diagnostic should not be in list");
+    expect(JSON.stringify(secondPage)).not.toContain("must not be selected");
   });
 
   it("subtracts prior cumulative usage while excluding the current run", async () => {

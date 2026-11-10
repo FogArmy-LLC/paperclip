@@ -6612,8 +6612,11 @@ export function agentRoutes(
     const agentId = req.query.agentId as string | undefined;
     const limitParam = req.query.limit as string | undefined;
     const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
+    const offsetParam = req.query.offset as string | undefined;
+    const offset = offsetParam ? Math.max(0, Math.min(100000, parseInt(offsetParam, 10) || 0)) : 0;
     const summary = req.query.summary === "true" || req.query.summary === "1";
-    const runs = await heartbeat.list(companyId, agentId, limit, { summary });
+    const compact = req.query.compact === "true" || req.query.compact === "1";
+    const runs = await heartbeat.list(companyId, agentId, limit, { summary, compact, offset });
     res.json(await runRedactions.redactForRuns(companyId, await Promise.all(runs.map(run => serializeRunListRow(req, run))),
       req.actor.type === "board" ? getActorInfo(req).actorId : null));
   });

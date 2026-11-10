@@ -108,6 +108,9 @@ export type RuntimeRequestResolution =
 
 export interface HeartbeatRunListOptions {
   summary?: boolean;
+  /** Keep history rows small while retaining the bounded summary fields used by the agent run list. */
+  compact?: boolean;
+  offset?: number;
 }
 
 export interface ProviderTraceInspection {
@@ -126,7 +129,9 @@ export const heartbeatsApi = {
     const searchParams = new URLSearchParams();
     if (agentId) searchParams.set("agentId", agentId);
     if (limit) searchParams.set("limit", String(limit));
+    if (options.offset) searchParams.set("offset", String(options.offset));
     if (options.summary) searchParams.set("summary", "true");
+    if (options.compact) searchParams.set("compact", "true");
     const qs = searchParams.toString();
     return api.get<HeartbeatRun[]>(
       `/companies/${companyId}/heartbeat-runs${qs ? `?${qs}` : ""}`,

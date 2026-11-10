@@ -191,6 +191,11 @@ export interface HeartbeatRun {
   exitCode: number | null;
   signal: string | null;
   usageJson: Record<string, unknown> | null;
+  /** Scalar usage fields returned by compact history rows. */
+  inputTokens?: number | null;
+  cachedInputTokens?: number | null;
+  outputTokens?: number | null;
+  totalTokens?: number | null;
   resultJson: Record<string, unknown> | null;
   sessionIdBefore: string | null;
   sessionIdAfter: string | null;
