@@ -177,12 +177,14 @@ describe("CompanySettings rename hint", () => {
 
     await act(async () => {
       toggle?.click();
+      await vi.waitFor(() => {
+        expect(container.querySelector('[role="alert"]')?.textContent).toBe(
+          "Company update denied",
+        );
+      });
     });
 
     expect(toggle?.getAttribute("aria-checked")).toBe("false");
-    expect(container.querySelector('[role="alert"]')?.textContent).toBe(
-      "Company update denied",
-    );
     flushSync(() => root.unmount());
   });
 });
