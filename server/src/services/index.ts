@@ -217,5 +217,6 @@ export {
   type RemoteAgentProfileInput,
   type RemoteAgentService,
 } from "./remote-agent-profiles.js";
+export { buildTenantAutonomyBootstrapPlan, tenantAutonomyService } from "./tenant-autonomy.js";
 
 export { decisionModelService, defineDecisionFeature } from "./decision-models.js";

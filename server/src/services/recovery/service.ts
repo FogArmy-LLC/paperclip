@@ -62,6 +62,7 @@ import {
   requiresExecutionReconciliation,
   type IssueCommentMetadata,
   type IssueCommentPresentation,
+  type IssueRecoveryAction,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -434,6 +435,12 @@ function resolveStrandedRecoveryCause(
 ): StrandedRecoveryCause {
   if (explicitCause) return explicitCause;
   if (isProviderQuotaRecovery(latestRun)) return "provider_quota";
+  if (
+    parseObject(latestRun?.resultJson).recoveryClassification ===
+    "capability_prerequisite"
+  ) {
+    return "configuration_incomplete";
+  }
   if (latestRun?.errorCode === "process_lost") return "process_lost";
   if (latestRun?.errorCode === "codex_output_inactivity_monitor") {
     return "codex_output_inactivity_monitor";
@@ -478,6 +485,20 @@ function readConfigurationIncompleteFingerprint(
 ): string | null {
   return readNonEmptyString(
     readConfigurationIncompletePayload(latestRun)?.fingerprint,
+  );
+}
+
+function readCapabilityPrerequisiteFingerprint(
+  latestRun: LatestIssueRun,
+): string | null {
+  const result = parseObject(latestRun?.resultJson);
+  const binding = parseObject(result.capabilityBinding);
+  const connection = parseObject(result.connectionFailure);
+  return (
+    readNonEmptyString(result.capabilityFingerprint) ??
+    readNonEmptyString(binding.fingerprint) ??
+    readNonEmptyString(connection.fingerprint) ??
+    null
   );
 }
 
@@ -578,11 +599,44 @@ const PROVIDER_QUOTA_ERROR_RE =
   /(?:you(?:'|’)ve hit your (?:\w+ )?limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
 const CONFIGURATION_INCOMPLETE_ERROR_RE =
   /(?:model_not_found|model [^\n]{0,120} not found|missing (?:api )?(?:key|credentials?)|credentials? (?:are |is )?missing|no (?:api )?(?:key|credentials?) (?:was |were )?(?:found|configured|provided)|api key (?:is )?(?:not set|unavailable))/i;
+const GITHUB_CAPABILITY_ERROR_RE =
+  /github[^\n]{0,160}(?:\b401\b|\b403\b|unauthori[sz]ed|forbidden)|(?:\b401\b|\b403\b|unauthori[sz]ed|forbidden)[^\n]{0,160}github/i;
 
 export type AdapterFailureRecoveryClassification =
   | { kind: "provider_quota"; retryAt: Date; parsedResetTime: boolean }
+  | { kind: "capability_prerequisite"; provider: "github"; status: 401 | 403 }
   | { kind: "configuration_incomplete" }
   | null;
+
+/**
+ * A repeated observation is not a corrective intervention. Capability
+ * recovery attempts advance only when the provider binding/scope fingerprint
+ * changes; this keeps sweeps and unchanged 401/403 reports idempotent.
+ */
+export function shouldReuseManagerCapabilityPrerequisite(input: {
+  existing: Pick<IssueRecoveryAction, "cause" | "fingerprint" | "ownerAgentId" | "attemptCount"> | null;
+  cause: string;
+  fingerprint: string;
+  ownerAgentId: string;
+}) {
+  const existing = input.existing;
+  return Boolean(
+    existing &&
+      existing.cause === input.cause &&
+      existing.fingerprint === input.fingerprint &&
+      existing.ownerAgentId === input.ownerAgentId,
+  );
+}
+
+export function isManagerCapabilityPrerequisiteExpired(input: {
+  deadlineAt: unknown;
+  now?: Date;
+}) {
+  if (typeof input.deadlineAt !== "string") return false;
+  const deadline = new Date(input.deadlineAt);
+  if (Number.isNaN(deadline.getTime())) return false;
+  return deadline.getTime() <= (input.now ?? new Date()).getTime();
+}
 
 function parseProviderQuotaClockReset(error: string, now: Date) {
   const match = error.match(
@@ -686,6 +740,10 @@ export function classifyAdapterFailureForRecovery(
     latestRun.error ?? "",
     JSON.stringify(resultJson),
   ].join("\n");
+  if (GITHUB_CAPABILITY_ERROR_RE.test(error)) {
+    const status = /\b403\b|forbidden/i.test(error) ? 403 : 401;
+    return { kind: "capability_prerequisite", provider: "github", status };
+  }
   if (
     latestRun.errorCode === "configuration_incomplete" ||
     CONFIGURATION_INCOMPLETE_ERROR_RE.test(error)
@@ -2509,6 +2567,19 @@ export function recoveryService(
     // reuses one. Configuration gaps with no fingerprint fall back to the
     // issue-and-cause scope below.
     if (input.recoveryCause === "configuration_incomplete") {
+      const capabilityFingerprint = readCapabilityPrerequisiteFingerprint(
+        input.latestRun,
+      );
+      if (capabilityFingerprint) {
+        return [
+          "source_scoped_recovery",
+          input.issue.companyId,
+          input.issue.id,
+          input.recoveryCause,
+          "capability",
+          capabilityFingerprint,
+        ].join(":");
+      }
       const configurationFingerprint = readConfigurationIncompleteFingerprint(
         input.latestRun,
       );
@@ -2581,8 +2652,37 @@ export function recoveryService(
       latestRun: input.latestRun,
     });
     const isProviderQuotaWait = recoveryCause === "provider_quota";
+    const latestResult = parseObject(input.latestRun?.resultJson);
+    const isCapabilityPrerequisite =
+      latestResult.recoveryClassification === "capability_prerequisite" &&
+      latestResult.capabilityProvider === "github";
+    const sourceAgentId = input.issue.assigneeAgentId ?? input.latestRun?.agentId ?? null;
+    const sourceAgent = sourceAgentId
+      ? await database
+          .select({ reportsTo: agents.reportsTo })
+          .from(agents)
+          .where(and(eq(agents.id, sourceAgentId), eq(agents.companyId, input.issue.companyId)))
+          .then((rows) => rows[0] ?? null)
+      : null;
+    const capabilityOwnerAgentId = isCapabilityPrerequisite ? sourceAgent?.reportsTo ?? null : null;
+    const managerOwnedCapability = Boolean(capabilityOwnerAgentId);
     const now = new Date();
     const actions = database === db ? recoveryActionsSvc : issueRecoveryActionService(database);
+    const existingAction = managerOwnedCapability
+      ? await actions.getActiveForIssue(input.issue.companyId, input.issue.id)
+      : null;
+    const capabilityAttemptAlreadyObserved = managerOwnedCapability && capabilityOwnerAgentId
+      ? shouldReuseManagerCapabilityPrerequisite({
+          existing: existingAction,
+          cause: recoveryCause,
+          fingerprint: strandedRecoveryActionFingerprint({
+            issue: input.issue,
+            recoveryCause,
+            latestRun: input.latestRun,
+          }),
+          ownerAgentId: capabilityOwnerAgentId,
+        })
+      : false;
     const action = await actions.upsertSourceScoped({
       companyId: input.issue.companyId,
       sourceIssueId: input.issue.id,
@@ -2591,10 +2691,13 @@ export function recoveryService(
       // distinct blocker, so it must get a new recovery action and notify the
       // operator, not overwrite the active action of the prior ref.
       supersedeOnIdentityChange: recoveryCause === "configuration_incomplete",
-      preserveExistingOwner: true,
+      // An unchanged denial is an observation, not another repair attempt.
+      // Preserve the existing manager action and its original deadline until
+      // a changed binding/scope fingerprint produces a distinct action.
+      preserveExistingOwner: capabilityAttemptAlreadyObserved || !managerOwnedCapability,
       kind: strandedRecoveryActionKind(recoveryCause),
-      ownerType: isProviderQuotaWait ? "system" : "board",
-      ownerAgentId: null,
+      ownerType: isProviderQuotaWait ? "system" : managerOwnedCapability ? "agent" : "board",
+      ownerAgentId: managerOwnedCapability ? capabilityOwnerAgentId : null,
       ownerUserId: null,
       previousOwnerAgentId: input.issue.assigneeAgentId,
       returnOwnerAgentId: routing.returnOwnerAgentId,
@@ -2604,6 +2707,7 @@ export function recoveryService(
         recoveryCause,
         latestRun: input.latestRun,
       }),
+      attemptCount: capabilityAttemptAlreadyObserved ? existingAction?.attemptCount : undefined,
       evidence: {
         ...buildStrandedRecoveryActionEvidence({
           issue: input.issue,
@@ -2617,7 +2721,9 @@ export function recoveryService(
       },
       evidenceOnCreate: isProviderQuotaWait
         ? {}
-        : { routingPolicy: STRANDED_BOARD_ESCALATION_POLICY },
+        : managerOwnedCapability
+          ? { routingPolicy: "manager_capability_prerequisite_v1", capabilityProvider: "github" }
+          : { routingPolicy: STRANDED_BOARD_ESCALATION_POLICY },
       nextAction:
         recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
           ? "Board operator: inspect the run evidence, then explicitly choose a valid issue disposition, retry the original owner, reassign, or intentionally resolve the task."
@@ -2651,6 +2757,8 @@ export function recoveryService(
                               ?.pluginStatus,
                           ) ?? "error",
                         )}, then explicitly retry the original owner or reassign.`
+                    : managerOwnedCapability
+                      ? "Manager: repair the provider capability binding or scope, record before and after receipts, then return the source issue to its original owner."
                       : "Board operator: bind the missing secret(s) named in the run failure, then explicitly retry the original owner or reassign."
                     : recoveryCause === "execution_review_participant_recovery"
                       ? "Board operator: repair the failed review participant path, restore a live reviewer, explicitly reassign, or record an intentional resolution."
@@ -2660,11 +2768,20 @@ export function recoveryService(
             type: "monitor_only",
             reason: recoveryCause,
           }
-        : {
-            type: "board_escalation",
-            reason: recoveryCause,
-            preservesSourceAssignee: true,
-          },
+        : managerOwnedCapability
+          ? {
+              type: "manager_capability_prerequisite",
+              reason: "github_capability_denied",
+              provider: "github",
+              status: latestResult.capabilityStatus === 403 ? 403 : 401,
+              preservesSourceAssignee: true,
+              deadlineAt: new Date(now.getTime() + 15 * 60 * 1000).toISOString(),
+            }
+          : {
+              type: "board_escalation",
+              reason: recoveryCause,
+              preservesSourceAssignee: true,
+            },
       monitorPolicy: isProviderQuotaWait
         ? { type: "wait_recovery", retryAgentId: routing.returnOwnerAgentId }
         : null,
@@ -2672,7 +2789,7 @@ export function recoveryService(
       lastAttemptAt: now,
     });
 
-    return action;
+    return { action, capabilityAttemptAlreadyObserved };
   }
 
   function readProviderQuotaRetryAt(latestRun: LatestIssueRun, now: Date) {
@@ -3559,6 +3676,67 @@ export function recoveryService(
       const wakePolicy = parseObject(action.wakePolicy);
       const wakePolicyType = readNonEmptyString(wakePolicy.type);
       if (
+        wakePolicyType === "manager_capability_prerequisite" &&
+        isManagerCapabilityPrerequisiteExpired({ deadlineAt: wakePolicy.deadlineAt })
+      ) {
+        const now = new Date();
+        const [escalated] = await db
+          .update(issueRecoveryActions)
+          .set({
+            ownerType: "board",
+            ownerAgentId: null,
+            ownerUserId: null,
+            previousOwnerAgentId: action.ownerAgentId ?? action.previousOwnerAgentId,
+            wakePolicy: {
+              type: "board_escalation",
+              reason: "manager_capability_deadline_missed",
+              preservesSourceAssignee: true,
+            },
+            evidence: {
+              ...(action.evidence ?? {}),
+              terminalReason: "manager_capability_deadline_missed",
+              managerCapabilityDeadlineAt: wakePolicy.deadlineAt,
+              escalatedAt: now.toISOString(),
+              routingPolicy: "manager_capability_prerequisite_v1",
+            },
+            nextAction:
+              "Board operator: the manager capability prerequisite missed its bounded deadline; inspect the binding evidence and choose the next governed action.",
+            timeoutAt: null,
+            outcome: "escalated",
+            resolutionNote: "manager_capability_deadline_missed",
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issueRecoveryActions.id, action.id),
+              inArray(issueRecoveryActions.status, ["active", "escalated"]),
+            ),
+          )
+          .returning();
+        if (escalated) {
+          await issuesSvc.update(issue.id, { status: "blocked" });
+          await issuesSvc.addComment(
+            issue.id,
+            [
+              "Paperclip escalated the GitHub capability prerequisite after its bounded manager deadline elapsed.",
+              "",
+              `- Deadline: \`${String(wakePolicy.deadlineAt)}\``,
+              "- Recovery owner: board",
+              "- Source ownership: unchanged; no additional corrective attempt was charged for repeated observations.",
+              "",
+              "Next action: inspect the binding evidence and choose the next governed action.",
+            ].join("\n"),
+            {},
+            { authorType: "system" },
+          );
+          result.escalated += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
+      if (
         wakePolicyType !== "bounded_recovery_owner" &&
         wakePolicyType !== "bounded_owner_disposition_repair" &&
         action.ownerType !== "board"
@@ -4053,6 +4231,14 @@ export function recoveryService(
   }) {
     const publications: ActivityPublication[] = [];
     const postCommitActions: IssuePostCommitAction[] = [];
+    const managerCapabilityWakeups: Array<{
+      agentId: string;
+      issueId: string;
+      actionId: string;
+      provider: "github";
+      status: 401 | 403;
+      deadlineAt: string;
+    }> = [];
     const updated = await db.transaction(async (tx) => {
       // Recovery observes candidates before asynchronous policy checks. Serialize
       // its effects with operator decisions; a stale observation grants no new
@@ -4087,11 +4273,51 @@ export function recoveryService(
       )).limit(1).then((rows) => rows[0] ?? null);
       if (pendingHandoff) return null;
 
-      return applyStrandedAssignedIssueEscalation(input, tx, publications, postCommitActions);
+      return applyStrandedAssignedIssueEscalation(
+        input,
+        tx,
+        publications,
+        postCommitActions,
+        managerCapabilityWakeups,
+      );
     });
     if (updated) {
       for (const publication of publications) publishActivity(publication);
       await executeIssuePostCommitActions(db, postCommitActions);
+      for (const wake of managerCapabilityWakeups) {
+        const queued = await deps.enqueueWakeup(wake.agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "manager_capability_prerequisite",
+          idempotencyKey: `manager-capability-prerequisite:${wake.actionId}`,
+          payload: {
+            issueId: wake.issueId,
+            recoveryActionId: wake.actionId,
+            capabilityProvider: wake.provider,
+            capabilityStatus: wake.status,
+            deadlineAt: wake.deadlineAt,
+            returnOwnerRequired: true,
+          },
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          contextSnapshot: {
+            issueId: wake.issueId,
+            taskId: wake.issueId,
+            wakeReason: "manager_capability_prerequisite",
+            source: "recovery.manager_capability_prerequisite",
+            recoveryActionId: wake.actionId,
+            capabilityProvider: wake.provider,
+            capabilityStatus: wake.status,
+            deadlineAt: wake.deadlineAt,
+          },
+        });
+        if (!queued) {
+          logger.warn(
+            { issueId: wake.issueId, recoveryActionId: wake.actionId, agentId: wake.agentId },
+            "manager capability prerequisite wake was deferred",
+          );
+        }
+      }
     }
     return updated;
   }
@@ -4101,6 +4327,14 @@ export function recoveryService(
     tx: DbTransaction,
     publications: ActivityPublication[],
     postCommitActions: IssuePostCommitAction[],
+    managerCapabilityWakeups: Array<{
+      agentId: string;
+      issueId: string;
+      actionId: string;
+      provider: "github";
+      status: 401 | 403;
+      deadlineAt: string;
+    }>,
   ) {
     // Bind implicit settings and policy reads to the held connection as well.
     const transactionIssuesSvc = issueService(tx as unknown as Db);
@@ -4116,13 +4350,14 @@ export function recoveryService(
       input.latestRun,
       input.recoveryCause,
     );
-    const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
+    const recoveryActionResult = await ensureSourceScopedStrandedRecoveryAction({
       issue: input.issue,
       previousStatus: input.previousStatus,
       latestRun: input.latestRun,
       recoveryCause,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
     }, tx);
+    const recoveryAction = recoveryActionResult.action;
     const isProviderQuotaWait =
       recoveryCause === "provider_quota" &&
       !recoveryAction.ownerAgentId &&
@@ -4146,6 +4381,24 @@ export function recoveryService(
       companyGuard: input.issue.companyId,
     }, tx, publications, postCommitActions);
     if (!updated) return null;
+    const recoveryWakePolicy = parseObject(recoveryAction.wakePolicy);
+    if (
+      !recoveryActionResult.capabilityAttemptAlreadyObserved &&
+      recoveryWakePolicy.type === "manager_capability_prerequisite" &&
+      recoveryAction.ownerAgentId &&
+      recoveryWakePolicy.provider === "github" &&
+      (recoveryWakePolicy.status === 401 || recoveryWakePolicy.status === 403) &&
+      typeof recoveryWakePolicy.deadlineAt === "string"
+    ) {
+      managerCapabilityWakeups.push({
+        agentId: recoveryAction.ownerAgentId,
+        issueId: input.issue.id,
+        actionId: recoveryAction.id,
+        provider: "github",
+        status: recoveryWakePolicy.status,
+        deadlineAt: recoveryWakePolicy.deadlineAt,
+      });
+    }
     if (isProviderQuotaWait) return updated;
     const sourceAssigneePreserved =
       updated.assigneeAgentId === input.issue.assigneeAgentId &&
@@ -4399,7 +4652,13 @@ export function recoveryService(
             transientRetryNotBefore: classification.retryAt.toISOString(),
             providerQuotaRetryNotBefore: classification.retryAt.toISOString(),
           }
-        : { errorFamily: "configuration_incomplete" };
+        : classification.kind === "capability_prerequisite"
+          ? {
+              errorFamily: "capability_prerequisite",
+              capabilityProvider: classification.provider,
+              capabilityStatus: classification.status,
+            }
+          : { errorFamily: "configuration_incomplete" };
     const errorCode = classification.kind;
 
     return {
@@ -5010,6 +5269,11 @@ export function recoveryService(
           result.skipped += 1;
           continue;
         } else {
+          latestRun = await persistAdapterFailureRecoveryClassification(
+            issue,
+            latestRun,
+            adapterFailureClassification,
+          );
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: issue.status as StrandedPreviousStatus,
@@ -5020,11 +5284,6 @@ export function recoveryService(
               "Moving the issue to `blocked` with the configuration fix recorded instead of creating a recovery takeover.",
           });
           if (updated) {
-            latestRun = await persistAdapterFailureRecoveryClassification(
-              issue,
-              latestRun,
-              adapterFailureClassification,
-            );
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
