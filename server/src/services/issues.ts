@@ -4964,6 +4964,11 @@ const issueListSelect = {
   `,
   status: issues.status,
   statusVersion: issues.statusVersion,
+  executionSlaFirstIdentifiedAt: issues.executionSlaFirstIdentifiedAt,
+  executionSlaWarningAttemptAt: issues.executionSlaWarningAttemptAt,
+  executionSlaBreachAttemptAt: issues.executionSlaBreachAttemptAt,
+  executionSlaWarningAt: issues.executionSlaWarningAt,
+  executionSlaBreachAt: issues.executionSlaBreachAt,
   lastStatusDecisionId: issues.lastStatusDecisionId,
   workMode: issues.workMode,
   harnessKind: issues.harnessKind,
@@ -10392,6 +10397,10 @@ export function issueService(db: Db) {
           issueNumber,
           identifier,
         } as typeof issues.$inferInsert;
+        // The first-identified execution clock is server-owned and immutable.
+        const firstIdentifiedAt = values.createdAt ?? new Date();
+        values.createdAt = firstIdentifiedAt;
+        values.executionSlaFirstIdentifiedAt = firstIdentifiedAt;
         if (values.status === "in_progress" && !values.startedAt) {
           values.startedAt = new Date();
         }
@@ -10886,6 +10895,8 @@ export function issueService(db: Db) {
         expectedExecutionPolicy,
         ...issueData
       } = data;
+      // Callers cannot rewrite the first-identified timestamp through issue updates.
+      delete issueData.executionSlaFirstIdentifiedAt;
       // An explicit edit claims the title, even if it keeps the same text.
       if (issueData.title !== undefined) issueData.titleNeedsGeneration = false;
       if (

@@ -50,6 +50,11 @@ describe("company schemas without the retired settings", () => {
     expect(result.success).toBe(true);
   });
 
+  it("allows a company admin to opt in to the critical execution SLA", () => {
+    expect(updateCompanySchema.parse({ executionSlaEnabled: true })).toEqual({ executionSlaEnabled: true });
+    expect(updateCompanySchema.parse({ executionSlaEnabled: false })).toEqual({ executionSlaEnabled: false });
+  });
+
   it("requires at least one branding field", () => {
     expect(updateCompanyBrandingSchema.safeParse({}).success).toBe(false);
   });

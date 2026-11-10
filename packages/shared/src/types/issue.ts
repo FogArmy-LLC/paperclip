@@ -909,6 +909,12 @@ export interface Issue {
   unblockDescriptor?: IssueUnblockDescriptor | null;
   blockedTransitionAt?: Date | null;
   blockedOwnerNotifiedAt?: Date | null;
+  /** Server-owned immutable first-identification time used by execution SLA. */
+  executionSlaFirstIdentifiedAt?: Date | null;
+  executionSlaWarningAttemptAt?: Date | null;
+  executionSlaBreachAttemptAt?: Date | null;
+  executionSlaWarningAt?: Date | null;
+  executionSlaBreachAt?: Date | null;
   activeRecoveryAction?: IssueRecoveryAction | null;
   successfulRunHandoff?: SuccessfulRunHandoffState | null;
   executionBlocker?: ExecutionBlocker | null;

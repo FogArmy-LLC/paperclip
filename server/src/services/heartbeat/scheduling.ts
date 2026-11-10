@@ -3,6 +3,7 @@ import {
   issueComments,
   heartbeatRuns,
   companies,
+  agentWakeupRequests,
   agentTaskSessions,
   agentSessionGoalActions,
   agents,
@@ -27,6 +28,7 @@ import {
   lte,
   asc,
   getTableColumns,
+  gt,
   gte,
 } from "drizzle-orm";
 import { RECOVERY_ORIGIN_KINDS } from "../recovery/index.js";
@@ -50,6 +52,7 @@ import {
 import { logger } from "../../middleware/logger.js";
 import { failRunnerGoalAction } from "../runner-goals.js";
 import { evaluateAgentInvokability } from "../agent-invokability.js";
+import { executionSlaRetryDue, executionSlaStage } from "../execution-sla.js";
 import type { Db } from "@paperclipai/db";
 import type { issueService } from "../issues.js";
 import type { createHeartbeatQueue } from "./queue.js";
@@ -1152,6 +1155,257 @@ export function createHeartbeatScheduling(
     return { scanned: pending.length, enqueued, alreadyQueued, invalid };
   }
 
+  async function tickCriticalExecutionSla(
+    now: Date,
+    agentById: Map<string, typeof agents.$inferSelect>,
+  ) {
+    const warningCutoff = new Date(now.getTime() - 30 * 60 * 1000);
+    const breachCutoff = new Date(now.getTime() - 45 * 60 * 1000);
+    const retryCutoff = new Date(now.getTime() - 5 * 60 * 1000);
+    const dueIssues = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        title: issues.title,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        firstIdentifiedAt: sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.createdAt})`.mapWith(issues.createdAt),
+        executionSlaWarningAttemptAt: issues.executionSlaWarningAttemptAt,
+        executionSlaBreachAttemptAt: issues.executionSlaBreachAttemptAt,
+        executionSlaWarningAt: issues.executionSlaWarningAt,
+        executionSlaBreachAt: issues.executionSlaBreachAt,
+      })
+      .from(issues)
+      .innerJoin(companies, eq(companies.id, issues.companyId))
+      .where(and(
+        eq(companies.status, "active"),
+        eq(companies.executionSlaEnabled, true),
+        isNull(issues.hiddenAt),
+        inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
+        lte(sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.createdAt})`, warningCutoff),
+        or(
+          and(
+            isNull(issues.executionSlaBreachAt),
+            lte(sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.createdAt})`, breachCutoff),
+            or(isNull(issues.executionSlaBreachAttemptAt), lte(issues.executionSlaBreachAttemptAt, retryCutoff)),
+          ),
+          and(
+            isNull(issues.executionSlaBreachAt),
+            gt(sql<Date>`coalesce(${issues.executionSlaFirstIdentifiedAt}, ${issues.createdAt})`, breachCutoff),
+            isNull(issues.executionSlaWarningAt),
+            or(isNull(issues.executionSlaWarningAttemptAt), lte(issues.executionSlaWarningAttemptAt, retryCutoff)),
+          ),
+        ),
+      ))
+      .orderBy(asc(issues.createdAt), asc(issues.id))
+      .limit(100);
+
+    let enqueued = 0;
+    let skipped = 0;
+    const batches = new Map<string, {
+      companyId: string;
+      manager: typeof agents.$inferSelect;
+      stage: "warning" | "breach";
+      attemptColumn: "warning" | "breach";
+      issues: typeof dueIssues;
+    }>();
+    for (const issue of dueIssues) {
+      const owner = issue.assigneeAgentId ? agentById.get(issue.assigneeAgentId) : null;
+      const directManagerId = owner?.reportsTo ?? null;
+      const stageKey = executionSlaStage({
+        firstIdentifiedAt: issue.firstIdentifiedAt,
+        now,
+        warningAt: issue.executionSlaWarningAt,
+        breachAt: issue.executionSlaBreachAt,
+      });
+      const attemptAt = stageKey === "breach"
+        ? issue.executionSlaBreachAttemptAt
+        : issue.executionSlaWarningAttemptAt;
+      const stageFirstManagerId = stageKey === "breach"
+        ? agentById.get(directManagerId ?? "")?.reportsTo ?? directManagerId ?? [...agentById.values()].find((agent) => agent.companyId === issue.companyId && !agent.reportsTo)?.id ?? null
+        : directManagerId ?? [...agentById.values()].find((agent) => agent.companyId === issue.companyId && !agent.reportsTo)?.id ?? null;
+      const stages = stageKey && executionSlaRetryDue(attemptAt, now)
+        ? [{ key: stageKey, attemptColumn: stageKey, firstManagerId: stageFirstManagerId }]
+        : [];
+
+      for (const stage of stages) {
+        const claimAt = now;
+        const claimed = await db
+          .update(issues)
+          .set(stage.attemptColumn === "warning"
+            ? { executionSlaWarningAttemptAt: claimAt, updatedAt: now }
+            : { executionSlaBreachAttemptAt: claimAt, updatedAt: now })
+          .where(and(
+            eq(issues.id, issue.id),
+            eq(issues.companyId, issue.companyId),
+            inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
+            isNull(stage.attemptColumn === "warning" ? issues.executionSlaWarningAt : issues.executionSlaBreachAt),
+            or(
+              isNull(stage.attemptColumn === "warning" ? issues.executionSlaWarningAttemptAt : issues.executionSlaBreachAttemptAt),
+              lte(stage.attemptColumn === "warning" ? issues.executionSlaWarningAttemptAt : issues.executionSlaBreachAttemptAt, retryCutoff),
+            ),
+          ))
+          .returning({ id: issues.id });
+        if (claimed.length === 0) continue;
+
+        const companyAgents = agentById.size > 0
+          ? [...agentById.values()].filter((agent) => agent.companyId === issue.companyId)
+          : [];
+        const orgRows = companyAgents.map(toAgentOrgRow);
+        let candidateId = stage.firstManagerId;
+        let target: typeof agents.$inferSelect | null = null;
+        const visited = new Set<string>();
+        while (candidateId && !visited.has(candidateId)) {
+          visited.add(candidateId);
+          const candidate = agentById.get(candidateId);
+          if (!candidate || candidate.companyId !== issue.companyId) break;
+          const result = evaluateAgentInvokability(toAgentOrgRow(candidate), orgRows);
+          if (result.invokable) {
+            target = candidate;
+            break;
+          }
+          candidateId = candidate.reportsTo;
+        }
+
+        if (!target) {
+          skipped += 1;
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: "heartbeat_scheduler",
+            action: `issue.execution_sla_${stage.key}_manager_unavailable`,
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              firstIdentifiedAt: issue.firstIdentifiedAt.toISOString(),
+              deadlineAt: new Date(issue.firstIdentifiedAt.getTime() + 45 * 60 * 1000).toISOString(),
+              expectedManagerAgentId: stage.firstManagerId,
+              attemptedAt: now.toISOString(),
+            },
+          });
+          continue;
+        }
+        const batchKey = `${issue.companyId}:${target.id}:${stage.key}`;
+        const batch = batches.get(batchKey) ?? {
+          companyId: issue.companyId,
+          manager: target,
+          stage: stage.key,
+          attemptColumn: stage.attemptColumn,
+          issues: [],
+        };
+        batch.issues.push(issue);
+        batches.set(batchKey, batch);
+      }
+    }
+
+    // Coalesce overdue work by capable manager and stage. Preserve one receipt
+    // per source issue, while bounding a scheduler tick to one wake per manager.
+    for (const batch of batches.values()) {
+      const idempotencyWindow = Math.floor(now.getTime() / (5 * 60 * 1000));
+      const issueIds = batch.issues.map((issue) => issue.id).sort();
+      const idempotencyKey = `execution-sla:${batch.companyId}:${batch.manager.id}:${batch.stage}:${idempotencyWindow}:${issueIds.join(",")}`;
+      const wakeReason = `critical_execution_sla_${batch.stage}`;
+      let wake: Awaited<ReturnType<typeof enqueueWakeup>> | null = null;
+      let dispatchError: string | null = null;
+      try {
+        wake = await enqueueWakeup(batch.manager.id, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: wakeReason,
+          idempotencyKey,
+          requestedByActorType: "system",
+          requestedByActorId: "heartbeat_scheduler",
+          payload: { issueIds },
+          contextSnapshot: {
+            source: "scheduler",
+            wakeReason,
+            executionSla: {
+              stage: batch.stage,
+              managerAgentId: batch.manager.id,
+              ownerMustContinueInParallel: true,
+              mayCancelOwnerExecution: false,
+              issues: batch.issues.map((issue) => ({
+                issueId: issue.id,
+                identifier: issue.identifier,
+                title: issue.title,
+                firstIdentifiedAt: issue.firstIdentifiedAt.toISOString(),
+                deadlineAt: new Date(issue.firstIdentifiedAt.getTime() + 45 * 60 * 1000).toISOString(),
+                originalOwnerAgentId: issue.assigneeAgentId,
+              })),
+            },
+          },
+        });
+      } catch (error) {
+        dispatchError = error instanceof Error ? error.message : String(error);
+      }
+      const wakeReceipt = await db
+        .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.companyId, batch.companyId),
+          eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      const delivered = wakeReceipt && !["skipped", "failed", "cancelled"].includes(wakeReceipt.status);
+      if (delivered) {
+        enqueued += 1;
+        const marker = batch.attemptColumn === "warning" ? issues.executionSlaWarningAt : issues.executionSlaBreachAt;
+        for (const issue of batch.issues) {
+          await db.update(issues)
+            .set(batch.attemptColumn === "warning"
+              ? { executionSlaWarningAt: now, updatedAt: now }
+              : { executionSlaBreachAt: now, updatedAt: now })
+            .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId), isNull(marker)));
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: "heartbeat_scheduler",
+            action: `issue.execution_sla_${batch.stage}_dispatched`,
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              firstIdentifiedAt: issue.firstIdentifiedAt.toISOString(),
+              deadlineAt: new Date(issue.firstIdentifiedAt.getTime() + 45 * 60 * 1000).toISOString(),
+              managerAgentId: batch.manager.id,
+              wakeRequestId: wakeReceipt.id,
+              wakeRequestStatus: wakeReceipt.status,
+              durableWakeReceiptConfirmed: true,
+              batchIssueCount: batch.issues.length,
+              attemptedAt: now.toISOString(),
+            },
+          });
+        }
+      } else {
+        skipped += batch.issues.length;
+        for (const issue of batch.issues) {
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: "heartbeat_scheduler",
+            action: `issue.execution_sla_${batch.stage}_dispatch_failed`,
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              firstIdentifiedAt: issue.firstIdentifiedAt.toISOString(),
+              deadlineAt: new Date(issue.firstIdentifiedAt.getTime() + 45 * 60 * 1000).toISOString(),
+              managerAgentId: batch.manager.id,
+              wakeRequestId: wakeReceipt?.id ?? null,
+              wakeRequestStatus: wakeReceipt?.status ?? null,
+              wakeEnqueueReturned: Boolean(wake),
+              durableWakeReceiptConfirmed: false,
+              dispatchError,
+              attemptedAt: now.toISOString(),
+            },
+          });
+        }
+      }
+    }
+    return { checked: dueIssues.length, enqueued, skipped };
+  }
+
   async function tickTimers(now = new Date()) {
       if ((await getSchedulingSuppression()).suppressed) {
         return {
@@ -1170,6 +1424,7 @@ export function createHeartbeatScheduling(
       const agentsByCompany = groupAgentOrgRowsByCompany(
         allAgents.map(toAgentOrgRow),
       );
+      const agentById = new Map(allAgents.map((agent) => [agent.id, agent]));
       let checked = 0;
       let enqueued = 0;
       let skipped = 0;
@@ -1231,11 +1486,12 @@ export function createHeartbeatScheduling(
       }
 
       const issueMonitors = await tickDueIssueMonitors(now);
+      const executionSla = await tickCriticalExecutionSla(now, agentById);
 
       return {
-        checked: checked + issueMonitors.checked,
-        enqueued: enqueued + issueMonitors.triggered,
-        skipped: skipped + issueMonitors.skipped,
+        checked: checked + issueMonitors.checked + executionSla.checked,
+        enqueued: enqueued + issueMonitors.triggered + executionSla.enqueued,
+        skipped: skipped + issueMonitors.skipped + executionSla.skipped,
       };
     }
 
