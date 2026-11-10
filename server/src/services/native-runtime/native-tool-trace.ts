@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { CAPABILITY_SEMANTIC_TOOL_CATALOG } from "../../vendor/paperclip-runner/index.js";
 import type { NativeRunTrace } from "./native-run-trace.js";
 
@@ -44,13 +45,21 @@ export function createNativeToolTrace(trace: NativeRunTrace, now = Date.now) {
     },
     async execute<T>(call: { callId: string; tool: string }, work: () => Promise<T>): Promise<T> {
       const scope = trace.start("tool.execute", {
-        parentName: "agent.turn", startedAtMs: now(), attributes: { operation: operation(call.tool) },
+        parentName: "agent.turn", startedAtMs: now(), attributes: { operation: operation(call.tool), call_id: createHash("sha256").update(call.callId).digest("hex").slice(0, 12) },
       });
       let outcome: "ok" | "failed" = "ok";
       try {
-        return await trace.run(scope, work);
+        const result = await trace.run(scope, work);
+        const value = result && typeof result === "object" ? result as Record<string, unknown> : {};
+        // Native semantic tools also return failed HTTP/bridge receipts without throwing.
+        const unknown = value.outcome === "unknown";
+        const isError = value.isError === true || value.ok === false || value.outcome === "failed" || unknown;
+        if (isError) outcome = "failed";
+        trace.annotate(scope, { result_state: unknown ? "outcome_unknown" : isError ? "tool_error" : "returned" });
+        return result;
       } catch (error) {
         outcome = "failed";
+        trace.annotate(scope, { result_state: "threw" });
         throw error;
       } finally {
         await trace.end(scope, { endedAtMs: now(), outcome });

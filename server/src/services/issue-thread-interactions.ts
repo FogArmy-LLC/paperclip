@@ -1,3 +1,4 @@
+import { emitFollowThrough } from "./follow-through-trace.js";
 import { normalizeEscapedLineBreaks } from "@paperclipai/shared/validators/text";
 import { notifyDeliveryWork, DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { activeIssueInteractionCondition, historicalQuestionCondition } from "./issue-question-context.js";
@@ -1362,6 +1363,24 @@ async function emitInteractionResolvedTelemetry(
     creatorRoleByAgentId?: ReadonlyMap<string, string | null>;
   },
 ) {
+  // Operator observability is independent of the first-party telemetry opt-out.
+  // Record the persisted review verdict, never infer delivered/business acceptance.
+  if (isNativeCompletionReview(interaction) && ["accepted", "rejected"].includes(interaction.status)) {
+    emitFollowThrough({ companyId: interaction.companyId, pluginEvent: null, payload: {
+      issueId: interaction.issueId, action: "issue.completion_review_resolved",
+      runId: interaction.resolvedByRunId,
+      details: {
+        decisionId: interaction.id, sourceRunId: interaction.sourceRunId,
+        reviewStatus: interaction.status,
+        independentReviewer: Boolean(
+          (interaction.resolvedByUserId && interaction.createdByUserId && interaction.resolvedByUserId !== interaction.createdByUserId) ||
+          (interaction.resolvedByAgentId && interaction.createdByAgentId && interaction.resolvedByAgentId !== interaction.createdByAgentId) ||
+          (interaction.resolvedByUserId && interaction.createdByAgentId) ||
+          (interaction.resolvedByAgentId && interaction.createdByUserId)
+        ),
+      },
+    } });
+  }
   const telemetryClient = getTelemetryClient();
   if (!telemetryClient) return;
 

@@ -157,6 +157,8 @@ const SAFE_NATIVE_RUN_SPAN_ATTRIBUTE_KEYS = new Set([
   "mode",
   "outcome",
   "operation",
+  "call_id",
+  "result_state",
   "provider",
   "reason",
   "runtime",
@@ -204,6 +206,7 @@ export function createNativeRunTrace(input: {
   /** Trusted run binding from heartbeat/native execution, never span attributes. */
   companyId: string;
   runId: string;
+  issueId?: string | null;
   runtime?: "paperclip_runner" | "direct_adapter";
   startedAtMs?: number;
   onEvent?: NativeRunTraceSink;
@@ -219,6 +222,7 @@ export function createNativeRunTrace(input: {
       ? { "paperclip.task.run.company_id": input.companyId }
       : {}),
     "paperclip.task.run.run_id": runIdHash,
+    ...(input.issueId && COMPANY_ID_PATTERN.test(input.issueId) ? { "paperclip.task.run.task_id": hashedId(input.issueId) } : {}),
   };
   let rootSpan: SpanHandle;
   try {

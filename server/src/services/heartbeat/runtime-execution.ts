@@ -799,6 +799,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
             const runTrace = createNativeRunTrace({
               companyId: agent.companyId,
               runId: run.id,
+              issueId: issueRef?.id,
               runtime: "direct_adapter",
               startedAtMs: Date.now(),
               traceContext: input.trace.traceContext ?? getStartupTraceContext("paperclip.direct-adapter-run"),
