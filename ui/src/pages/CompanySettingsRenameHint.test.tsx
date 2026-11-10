@@ -167,4 +167,22 @@ describe("CompanySettings rename hint", () => {
     });
     flushSync(() => root.unmount());
   });
+
+  it("keeps the setting off and exposes the server error when the update fails", async () => {
+    mockCompaniesApi.update.mockRejectedValue(new Error("Company update denied"));
+    const root = render(SELF_HOSTED_HEALTH);
+    const toggle = container.querySelector<HTMLButtonElement>(
+      '[data-testid="company-settings-execution-sla-toggle"]',
+    );
+
+    await act(async () => {
+      toggle?.click();
+    });
+
+    expect(toggle?.getAttribute("aria-checked")).toBe("false");
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe(
+      "Company update denied",
+    );
+    flushSync(() => root.unmount());
+  });
 });
