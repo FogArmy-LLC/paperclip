@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { PROVIDER_QUOTA_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
 import {
@@ -357,6 +357,16 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
     await heartbeat.tickTimers(new Date("2026-04-11T12:44:59.999Z"));
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, managerId))).toHaveLength(1);
+    const activeRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: activeRunId,
+      companyId,
+      agentId,
+      nativeIssueId: issueId,
+      runtimeMode: "native",
+      status: "running",
+      contextSnapshot: { issueId },
+    });
     await heartbeat.tickTimers(new Date("2026-04-11T12:45:00.000Z"));
     const dispatched = await db.select().from(agentWakeupRequests)
       .where(sql`${agentWakeupRequests.companyId} = ${companyId} and ${agentWakeupRequests.reason} like 'critical_execution_sla_%'`);
@@ -367,6 +377,10 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(dispatched[0]?.agentId).toBe(managerId);
     expect(dispatched[1]?.agentId).toBe(alternateManagerId);
     expect(dispatched[1]?.payload).toMatchObject({ issueIds: [issueId] });
+    expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, activeRunId), eq(heartbeatRuns.status, "running")))).toHaveLength(1);
+    const [stillOwned] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(stillOwned.assigneeAgentId).toBe(agentId);
     await heartbeat.tickTimers(new Date("2026-04-11T12:46:00.000Z"));
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, managerId))).toHaveLength(1);
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, alternateManagerId))).toHaveLength(1);

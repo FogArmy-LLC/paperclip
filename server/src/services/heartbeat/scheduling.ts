@@ -1222,12 +1222,14 @@ export function createHeartbeatScheduling(
       .orderBy(asc(issues.createdAt), asc(issues.id))
       .limit(100);
 
-    // A pending SLA wake or an active source run is real bounded work, not a
-    // reason to open another recovery lane. Keep the breach obligation open,
-    // but coalesce until that execution returns or the wake ages out.
+    // Active runs fence assignment transfer, but never suppress deadline
+    // escalation. Pending wakes coalesce only duplicate notifications for the
+    // same stage; warning cannot block breach escalation.
     const dueIssueIds = dueIssues.map((issue) => issue.id);
     const activeIssueIds = new Set<string>();
-    const pendingWakeIssueIds = new Set<string>();
+    const pendingWarningIssueIds = new Set<string>();
+    const pendingBreachIssueIds = new Set<string>();
+    const pendingTakeoverIssueIds = new Set<string>();
     if (dueIssueIds.length > 0) {
       const activeRuns = await db
         .select({ nativeIssueId: heartbeatRuns.nativeIssueId, issueId: heartbeatRuns.issueId })
@@ -1245,7 +1247,7 @@ export function createHeartbeatScheduling(
         if (run.issueId) activeIssueIds.add(run.issueId);
       }
       const pendingWakes = await db
-        .select({ payload: agentWakeupRequests.payload })
+        .select({ payload: agentWakeupRequests.payload, reason: agentWakeupRequests.reason })
         .from(agentWakeupRequests)
         .where(and(
           inArray(agentWakeupRequests.companyId, [...new Set(dueIssues.map((issue) => issue.companyId))]),
@@ -1260,7 +1262,9 @@ export function createHeartbeatScheduling(
           : [];
         const singleIssueId = readNonEmptyString(payload.issueId ?? payload.taskId);
         for (const issueId of [...issueIds, ...(singleIssueId ? [singleIssueId] : [])]) {
-          pendingWakeIssueIds.add(issueId);
+          if (request.reason === "critical_execution_sla_warning") pendingWarningIssueIds.add(issueId);
+          else if (request.reason === "critical_execution_sla_breach") pendingBreachIssueIds.add(issueId);
+          else if (request.reason === "issue_assigned") pendingTakeoverIssueIds.add(issueId);
         }
       }
     }
@@ -1440,9 +1444,8 @@ export function createHeartbeatScheduling(
       }
       const lastAttemptAt = pending.lastAttemptAt
         ?? (typeof dispatch.lastAttemptAt === "string" ? new Date(dispatch.lastAttemptAt) : null);
-      if (!ownerId || dispatchStatus === "queued" || activeIssueIds.has(pending.sourceIssueId) || pendingWakeIssueIds.has(pending.sourceIssueId) ||
-        (lastAttemptAt && lastAttemptAt.getTime() > retryCutoff.getTime()) ||
-        activeIssueIds.has(pending.sourceIssueId) || pendingWakeIssueIds.has(pending.sourceIssueId)) continue;
+      if (!ownerId || dispatchStatus === "queued" || activeIssueIds.has(pending.sourceIssueId) || pendingTakeoverIssueIds.has(pending.sourceIssueId) ||
+        (lastAttemptAt && lastAttemptAt.getTime() > retryCutoff.getTime())) continue;
       const owner = agentById.get(ownerId);
       if (!owner || owner.companyId !== pending.companyId ||
         !evaluateAgentInvokability(toAgentOrgRow(owner), [...agentById.values()].filter((agent) => agent.companyId === pending.companyId).map(toAgentOrgRow)).invokable) continue;
@@ -1599,10 +1602,6 @@ export function createHeartbeatScheduling(
       issues: typeof dueIssues;
     }>();
     for (const issue of dueIssues) {
-      if (activeIssueIds.has(issue.id) || pendingWakeIssueIds.has(issue.id)) {
-        skipped += 1;
-        continue;
-      }
       const owner = issue.assigneeAgentId ? agentById.get(issue.assigneeAgentId) : null;
       const directManagerId = owner?.reportsTo ?? null;
       const stageKey = executionSlaStage({
@@ -1611,6 +1610,14 @@ export function createHeartbeatScheduling(
         warningAt: issue.executionSlaWarningAt,
         breachAt: issue.executionSlaBreachAt,
       });
+      // A fresh wake for this same stage coalesces duplicate notification, but
+      // another stage must still escalate independently. Active runs never
+      // suppress escalation; they only fence reassignment and workspace writes.
+      if ((stageKey === "warning" && pendingWarningIssueIds.has(issue.id)) ||
+        (stageKey === "breach" && pendingBreachIssueIds.has(issue.id))) {
+        skipped += 1;
+        continue;
+      }
       const attemptAt = stageKey === "breach"
         ? issue.executionSlaBreachAttemptAt
         : issue.executionSlaWarningAttemptAt;
