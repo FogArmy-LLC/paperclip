@@ -1270,9 +1270,12 @@ export function createHeartbeatScheduling(
       const attemptAt = stageKey === "breach"
         ? issue.executionSlaBreachAttemptAt
         : issue.executionSlaWarningAttemptAt;
-      const stageFirstManagerId = stageKey === "breach"
-        ? agentById.get(directManagerId ?? "")?.reportsTo ?? directManagerId ?? [...agentById.values()].find((agent) => agent.companyId === issue.companyId && !agent.reportsTo)?.id ?? null
-        : directManagerId ?? [...agentById.values()].find((agent) => agent.companyId === issue.companyId && !agent.reportsTo)?.id ?? null;
+      // Start with the accountable direct manager for both warning and breach.
+      // If that seat is unavailable, the loop below follows reportsTo upward;
+      // starting at the manager's manager would skip a capable direct owner.
+      const stageFirstManagerId = directManagerId
+        ?? [...agentById.values()].find((agent) => agent.companyId === issue.companyId && !agent.reportsTo)?.id
+        ?? null;
       const stages = stageKey && executionSlaRetryDue(attemptAt, now)
         ? [{ key: stageKey, attemptColumn: stageKey, firstManagerId: stageFirstManagerId }]
         : [];

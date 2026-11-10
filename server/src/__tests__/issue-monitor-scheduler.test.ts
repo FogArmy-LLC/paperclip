@@ -159,6 +159,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     createdAt?: Date;
     withManager?: boolean;
     managerStatus?: "active" | "paused";
+    managerReportsToAlternate?: boolean;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -185,6 +186,23 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       executionSlaEnabled: input?.executionSlaEnabled ?? false,
     });
 
+    const alternateManagerId = input?.withManager && input.managerReportsToAlternate
+      ? randomUUID()
+      : null;
+    if (alternateManagerId) {
+      await db.insert(agents).values({
+        id: alternateManagerId,
+        companyId,
+        name: "Alternate Manager Bot",
+        role: "manager",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: { command: process.execPath, args: ["-e", ""], cwd: process.cwd() },
+        runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
+        permissions: {},
+      });
+    }
+
     const managerId = input?.withManager ? randomUUID() : null;
     if (managerId) {
       await db.insert(agents).values({
@@ -197,6 +215,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         adapterConfig: { command: process.execPath, args: ["-e", ""], cwd: process.cwd() },
         runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
         permissions: {},
+        reportsTo: alternateManagerId,
       });
     }
 
@@ -284,10 +303,11 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       issueStatus: "blocked",
       createdAt: firstIdentifiedAt,
       withManager: true,
+      managerReportsToAlternate: true,
       monitor: { nextCheckAt: "2027-04-11T12:30:00.000Z" },
     });
     const managerId = await db.select({ id: agents.id }).from(agents)
-      .where(sql`${agents.companyId} = ${companyId} and ${agents.role} = 'manager'`)
+      .where(sql`${agents.companyId} = ${companyId} and ${agents.name} = 'Manager Bot'`)
       .then(rows => rows[0]!.id);
     const heartbeat = heartbeatService(db);
 
@@ -358,7 +378,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       monitor: { nextCheckAt: "2027-04-11T12:30:00.000Z" },
     });
     const managerId = await db.select({ id: agents.id }).from(agents)
-      .where(sql`${agents.companyId} = ${companyId} and ${agents.role} = 'manager'`)
+      .where(sql`${agents.companyId} = ${companyId} and ${agents.name} = 'Manager Bot'`)
       .then(rows => rows[0]!.id);
     await heartbeatService(db).tickTimers(new Date("2026-04-11T12:45:00.000Z"));
     expect(await db.select().from(agentWakeupRequests)
