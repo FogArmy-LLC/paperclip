@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { flushSync } from "react-dom";
+import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -31,6 +32,7 @@ const SELECTED_COMPANY = {
   logoUrl: null,
   attachmentMaxBytes: null,
   requireBoardApprovalForNewAgents: false,
+  executionSlaEnabled: false,
   interactionResolverGovernance: {},
 };
 
@@ -141,6 +143,48 @@ describe("CompanySettings rename hint", () => {
   it("stays silent on a self-hosted instance, where a rename keeps the prefix", () => {
     const root = render(SELF_HOSTED_HEALTH);
     expect(hintText()).toBeUndefined();
+    flushSync(() => root.unmount());
+  });
+
+  it("enables company-scoped execution SLA escalation through the existing company update API", async () => {
+    mockCompaniesApi.update.mockResolvedValue({
+      ...SELECTED_COMPANY,
+      executionSlaEnabled: true,
+    });
+    const root = render(SELF_HOSTED_HEALTH);
+    const toggle = container.querySelector<HTMLButtonElement>(
+      '[data-testid="company-settings-execution-sla-toggle"]',
+    );
+
+    expect(toggle).toBeTruthy();
+    expect(toggle?.getAttribute("aria-checked")).toBe("false");
+    await act(async () => {
+      toggle?.click();
+    });
+
+    expect(mockCompaniesApi.update).toHaveBeenCalledWith("company-1", {
+      executionSlaEnabled: true,
+    });
+    flushSync(() => root.unmount());
+  });
+
+  it("keeps the setting off and exposes the server error when the update fails", async () => {
+    mockCompaniesApi.update.mockRejectedValue(new Error("Company update denied"));
+    const root = render(SELF_HOSTED_HEALTH);
+    const toggle = container.querySelector<HTMLButtonElement>(
+      '[data-testid="company-settings-execution-sla-toggle"]',
+    );
+
+    await act(async () => {
+      toggle?.click();
+      await vi.waitFor(() => {
+        expect(container.querySelector('[role="alert"]')?.textContent).toBe(
+          "Company update denied",
+        );
+      });
+    });
+
+    expect(toggle?.getAttribute("aria-checked")).toBe("false");
     flushSync(() => root.unmount());
   });
 });
