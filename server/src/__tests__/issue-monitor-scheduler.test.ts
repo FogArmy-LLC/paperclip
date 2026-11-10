@@ -402,6 +402,25 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(retried.executionSlaBreachAttemptAt?.toISOString()).toBe("2026-04-11T12:50:00.000Z");
   });
 
+  it("does not disclose private issue context to an ungranted same-company manager", async () => {
+    const { companyId, issueId } = await seedFixture({
+      executionSlaEnabled: true,
+      issueStatus: "blocked",
+      createdAt: new Date("2026-04-11T12:00:00.000Z"),
+      withManager: true,
+    });
+    await db.update(issues).set({ visibility: "private" }).where(eq(issues.id, issueId));
+
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:45:00.000Z"));
+
+    expect(await db.select().from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.companyId} = ${companyId} and ${agentWakeupRequests.reason} like 'critical_execution_sla_%'`))
+      .toHaveLength(0);
+    const events = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(events.map(row => row.action)).toContain("issue.execution_sla_breach_manager_unavailable");
+    expect(events.some(row => JSON.stringify(row.details).includes("Watch external deploy"))).toBe(false);
+  });
+
   it("triggers due issue monitors once and clears the one-shot schedule", async () => {
     const { issueId, agentId } = await seedFixture();
     const heartbeat = heartbeatService(db);

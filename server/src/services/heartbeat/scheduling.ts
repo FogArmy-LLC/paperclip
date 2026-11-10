@@ -52,6 +52,7 @@ import {
 import { logger } from "../../middleware/logger.js";
 import { failRunnerGoalAction } from "../runner-goals.js";
 import { evaluateAgentInvokability } from "../agent-invokability.js";
+import { issueReadSqlCondition } from "../authorization.js";
 import { executionSlaRetryDue, executionSlaStage } from "../execution-sla.js";
 import type { Db } from "@paperclipai/db";
 import type { issueService } from "../issues.js";
@@ -1312,7 +1313,21 @@ export function createHeartbeatScheduling(
           const candidate = agentById.get(candidateId);
           if (!candidate || candidate.companyId !== issue.companyId) break;
           const result = evaluateAgentInvokability(toAgentOrgRow(candidate), orgRows);
-          if (result.invokable) {
+          const candidateCanReadIssue = result.invokable && await db
+            .select({ id: issues.id })
+            .from(issues)
+            .where(and(
+              eq(issues.id, issue.id),
+              eq(issues.companyId, issue.companyId),
+              await issueReadSqlCondition(db, {
+                type: "agent",
+                agentId: candidate.id,
+                companyId: candidate.companyId,
+              }),
+            ))
+            .limit(1)
+            .then((rows) => rows.length > 0);
+          if (candidateCanReadIssue) {
             target = candidate;
             break;
           }
