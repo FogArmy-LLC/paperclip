@@ -12,6 +12,7 @@ import {
   connectionGrants,
   issueRecoveryActions,
   workspaceOperations,
+  projectWorkspaces,
 } from "@paperclipai/db";
 import {
   type IssueExecutionMonitorPolicy,
@@ -1177,6 +1178,7 @@ export function createHeartbeatScheduling(
       .select({
         id: issues.id,
         companyId: issues.companyId,
+        projectId: issues.projectId,
         projectWorkspaceId: issues.projectWorkspaceId,
         identifier: issues.identifier,
         title: issues.title,
@@ -1263,7 +1265,13 @@ export function createHeartbeatScheduling(
       candidate: typeof agents.$inferSelect,
       readDb: Db = db,
     ) {
-      if (!issue.projectWorkspaceId || !issue.assigneeAgentId) return null;
+      if (!issue.projectId || !issue.projectWorkspaceId || !issue.assigneeAgentId) return null;
+      const [registeredWorkspace] = await readDb.select({ id: projectWorkspaces.id }).from(projectWorkspaces).where(and(
+        eq(projectWorkspaces.id, issue.projectWorkspaceId),
+        eq(projectWorkspaces.companyId, issue.companyId),
+        eq(projectWorkspaces.projectId, issue.projectId),
+      )).limit(1);
+      if (!registeredWorkspace) return null;
       // Capability evidence must identify the same concrete connection as the
       // latest failed source operation, so gather the source failures first.
       const sourceEvents = await readDb
@@ -1287,6 +1295,7 @@ export function createHeartbeatScheduling(
           eq(toolCallEvents.issueId, issue.id),
           eq(toolCallEvents.agentId, issue.assigneeAgentId),
           eq(issues.projectWorkspaceId, issue.projectWorkspaceId),
+          eq(issues.projectId, issue.projectId),
           gte(toolCallEvents.createdAt, issue.blockedTransitionAt ?? issue.firstIdentifiedAt),
           lte(toolCallEvents.createdAt, now),
           inArray(toolCallEvents.eventType, ["call_failed", "call_denied"]),
@@ -1353,6 +1362,7 @@ export function createHeartbeatScheduling(
           eq(toolCallEvents.eventType, "call_completed"),
           eq(toolCallEvents.outcome, "success"),
           eq(issues.projectWorkspaceId, issue.projectWorkspaceId),
+          eq(issues.projectId, issue.projectId),
           gte(toolCallEvents.createdAt, new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)),
           lte(toolCallEvents.createdAt, now),
         ))
@@ -1494,6 +1504,7 @@ export function createHeartbeatScheduling(
               companyId: issues.companyId,
               status: issues.status,
               assigneeAgentId: issues.assigneeAgentId,
+              projectId: issues.projectId,
               projectWorkspaceId: issues.projectWorkspaceId,
               executionSlaFirstIdentifiedAt: issues.executionSlaFirstIdentifiedAt,
               blockedTransitionAt: issues.blockedTransitionAt,
@@ -1503,6 +1514,7 @@ export function createHeartbeatScheduling(
             )).for("update");
             if (!current || current.assigneeAgentId !== issue.assigneeAgentId ||
               current.projectWorkspaceId !== issue.projectWorkspaceId ||
+              current.projectId !== issue.projectId ||
               (current.executionSlaFirstIdentifiedAt ?? current.blockedTransitionAt)?.getTime() !== issue.firstIdentifiedAt.getTime() ||
               current.blockedTransitionAt?.getTime() !== issue.blockedTransitionAt?.getTime() ||
               !["backlog", "todo", "in_progress", "in_review", "blocked"].includes(current.status)) return null;
