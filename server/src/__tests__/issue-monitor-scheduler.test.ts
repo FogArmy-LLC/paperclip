@@ -378,7 +378,8 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(wakes[0]?.payload).toMatchObject({ issueIds: [issueId] });
     const [retried] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(retried.executionSlaFirstIdentifiedAt?.toISOString()).toBe(firstIdentifiedAt.toISOString());
-    expect(retried.executionSlaBreachAt?.toISOString()).toBe("2026-04-11T12:50:00.000Z");
+    expect(retried.executionSlaBreachAt).toBeNull();
+    expect(retried.executionSlaBreachAttemptAt?.toISOString()).toBe("2026-04-11T12:50:00.000Z");
   });
 
   it("triggers due issue monitors once and clears the one-shot schedule", async () => {
