@@ -39,7 +39,10 @@ import { resolveManagedOpenAiBilling } from "@paperclipai/adapter-utils";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { heartbeatRuns, nativeRunFinalizations, workspaceOperations } from "@paperclipai/db";
 import { conflict } from "../../errors.js";
-import { getStartupTraceContext } from "../../instrumentation.js";
+import {
+  getStartupTraceContext,
+  type StartupTraceContextHandle,
+} from "../../instrumentation.js";
 import { logger } from "../../middleware/logger.js";
 import {
   buildNativeProviderEnvironment,
@@ -52,6 +55,7 @@ import {
   recordNativeFinalizationFailure,
 } from "../native-runtime/index.js";
 import {
+  createNativeRunTrace,
   buildNativeHeartbeatPreparationSpans,
   buildNativeWakeIngressSpan,
 } from "../native-runtime/native-run-trace.js";
@@ -157,6 +161,8 @@ export interface HeartbeatRuntimeExecutionInput {
     attemptStartedAtMs: number;
     environmentAcquireStartedAtMs: number;
     environmentRealizeEndedAtMs: number;
+    /** Injected only by focused execution tests; production uses the startup tracer. */
+    traceContext?: StartupTraceContextHandle;
   };
   control: {
     executionControl: ReturnType<typeof createAdapterExecutionControl>;
@@ -788,9 +794,20 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       }
       const guardedDispatch =
         await dispatchResolvedInteractionContinuationWithAtomicGate(
-          (markDispatchStarted) => {
+          async (markDispatchStarted) => {
             input.effects.onLegacyAdapterEntered();
-            return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
+            const runTrace = createNativeRunTrace({
+              companyId: agent.companyId,
+              runId: run.id,
+              runtime: "direct_adapter",
+              startedAtMs: Date.now(),
+              traceContext: input.trace.traceContext ?? getStartupTraceContext("paperclip.direct-adapter-run"),
+            });
+            let outcome: "ok" | "failed" = "ok";
+            const executionSpan = runTrace.start("adapter.execute");
+            try {
+              const result = await runTrace.run(executionSpan, () =>
+                withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
               getFreshSessionHandoff,
               agentIdentity,
               runId: run.id,
@@ -868,7 +885,19 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                 });
               },
               authToken: authToken ?? undefined,
-            }));
+              })),
+              );
+              if (result.exitCode !== 0 || result.signal !== null || result.timedOut) {
+                outcome = "failed";
+              }
+              return result;
+            } catch (error) {
+              outcome = "failed";
+              throw error;
+            } finally {
+              await runTrace.end(executionSpan, { outcome });
+              await runTrace.finish(outcome);
+            }
           },
         );
       if (!guardedDispatch.dispatched) return { dispatched: false };
