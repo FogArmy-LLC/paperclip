@@ -9494,6 +9494,7 @@ export function issueRoutes(
       eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
       sql`(${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA} OR ${inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES])})`,
       sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+      sql`${issueRecoveryActions.evidence}->'executionReconciliation' IS NULL`,
     )).orderBy(desc(issueRecoveryActions.createdAt));
     res.json({
       active,

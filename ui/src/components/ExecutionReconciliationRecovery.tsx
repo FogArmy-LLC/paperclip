@@ -20,7 +20,7 @@ export function ExecutionReconciliationRecovery({ issueId, companyId, action, ca
   const runId = action?.evidence.runId ?? action?.evidence.sourceRunId;
   const eligible = Boolean(action && action.companyId === companyId && action.sourceIssueId === issueId
     && action.ownerType === "board" && (["active", "escalated"].includes(action.status)
-      || (action.status === "resolved" && (action.evidence.automaticRecovery as { replay?: string } | undefined)?.replay === "blocked"))
+      || (action.status === "resolved" && !action.evidence.executionReconciliation && (action.evidence.automaticRecovery as { replay?: string } | undefined)?.replay === "blocked"))
     && requiresExecutionReconciliation(action.cause) && typeof runId === "string"
     && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId));
   const ready = eligible && canManage && stopped && outcome !== "" && evidence.trim().length >= 20;

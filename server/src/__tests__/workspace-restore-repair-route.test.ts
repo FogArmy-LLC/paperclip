@@ -168,6 +168,20 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       .not.toHaveProperty("executionReconciliation");
   });
 
+  it("reads a replay-blocked execution hold without workspace metadata, without exposing unrelated task or reconciled records", async () => {
+    const f = await seed(), other = await seed();
+    const evidence = {runId:f.sourceRunId, automaticRecovery:{replay:"blocked"}};
+    await db.update(issueRecoveryActions).set({evidence}).where(eq(issueRecoveryActions.id,f.actionId));
+    const {app,wake} = appFor();
+    const response = await request(app).get(`/api/issues/${f.issueId}/recovery-actions`).expect(200);
+    expect(response.body.actions.map((a:{id:string})=>a.id)).toContain(f.actionId);
+    expect(JSON.stringify(response.body)).not.toContain(other.actionId);
+    await db.update(issueRecoveryActions).set({evidence:{...evidence,executionReconciliation:{runId:f.sourceRunId}}}).where(eq(issueRecoveryActions.id,f.actionId));
+    const after = await request(app).get(`/api/issues/${f.issueId}/recovery-actions`).expect(200);
+    expect(after.body.actions.map((a:{id:string})=>a.id)).not.toContain(f.actionId);
+    expect(wake).not.toHaveBeenCalled();
+  });
+
   it("does not expose retained-source evidence to another company", async () => {
     const f = await seed(), other = await seed();
     const { app } = appFor({ type: "agent", source: "agent_jwt", companyId: other.companyId,
