@@ -164,6 +164,7 @@ function issueListSearchParams(filters?: IssueListFilters) {
 }
 
 export const issuesApi = {
+  recoveryActions: (id: string) => api.get<{ active: IssueRecoveryAction | null; actions: IssueRecoveryAction[] }>(`/issues/${id}/recovery-actions`),
   /** Fetch every page for bounded task-detail relations, not just the default first page. */
   listAll: async (companyId: string, filters: Omit<IssueListFilters, "limit" | "offset" | "sortField" | "sortDir" | "afterId" | "attention">, options?: RequestOptions): Promise<Issue[]> => {
     const pageSize = 500;

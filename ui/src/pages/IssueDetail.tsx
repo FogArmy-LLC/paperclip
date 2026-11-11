@@ -3,6 +3,7 @@ import { isLockedIssueStub, LockedIssueChip } from "@/components/LockedIssueChip
 import { canManageIssuePrivacy } from "../lib/issuePrivacy";
 import { TextAttachmentContext } from "../context/TextAttachmentContext";
 import { useTaskBrowsers, useBrowserArrivals } from "@/hooks/useTaskBrowsers";
+import { ExecutionReconciliationHistory } from "../components/ExecutionReconciliationRecovery";
 import { WorkspaceExportRecovery } from "../components/WorkspaceExportRecovery";
 import { DispositionRecoveryProvider } from "../components/DispositionRecoveryNotice";
 import { AgentAvatar } from "@/components/AgentAvatar";
@@ -7608,12 +7609,20 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     </>
   );
 
+  // Keep the evidence form in the thread's scroll surface. Outside it, the
+  // form can consume the fixed-height shell and put task actions under the composer.
+  const executionReconciliationBlock = resolvedDetailTab === "chat" ? <ExecutionReconciliationHistory
+    key={`execution-reconciliation:${issue.activeRecoveryAction?.id}:${issue.activeRecoveryAction?.updatedAt}`}
+    issueId={issue.id} companyId={issue.companyId} activeAction={issue.activeRecoveryAction ?? null}
+    canManage={canManageBoardRuntime} onRecorded={invalidateIssueDetail} className={shellSectionClass} /> : null;
+
   const taskChatThreadHeader = taskChatShellEnabled ? (
     <>
       {ancestorsNav}
       {createdFromNote}
       {issueHeaderBlock}
       {pluginOutletsBlock}
+      {executionReconciliationBlock}
     </>
   ) : undefined;
 
@@ -7655,6 +7664,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               className={shellSectionClass}
               action={issue.activeRecoveryAction ?? null} canManage={canManageBoardRuntime} onQueued={invalidateIssueDetail} />
           )}
+          {taskChatShellEnabled ? null : executionReconciliationBlock}
           {resolvedDetailTab === "chat" && issue.executionBlocker && (
             <ExecutionBlockerNotice className={shellSectionClass} companyId={issue.companyId} issueId={issue.id} blocker={issue.executionBlocker} onRetried={invalidateIssueDetail} />
           )}
