@@ -280,6 +280,132 @@ describe("native status authority", () => {
     );
   });
 
+  it("enforces strict server arbitration: rejected evidence blocks done and reviewPolicy server_arbiter disallows claims", () => {
+    // 1. Fully satisfied evidence except for rejectedEvidence > 0: MUST NOT transition to done
+    expect(
+      arbitrate({
+        assessment: assessment({
+          rejectedEvidence: [
+            {
+              ref: "evidence:rejected-1",
+              reason: "Evidence verification failed hash validation",
+            },
+          ],
+        }),
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        statusAction: "in_progress",
+        toStatus: "in_progress",
+        reasonCode: "completion_evidence_incomplete",
+      }),
+    );
+
+    // 2. completionClaimPolicyAccepted is true, but rejectedEvidence > 0: MUST NOT transition to done
+    expect(
+      arbitrate({
+        assessment: assessment({
+          rejectedEvidence: [
+            {
+              ref: "evidence:rejected-2",
+              reason: "Evidence payload malformed",
+            },
+          ],
+        }),
+        completionClaimPolicyAccepted: true,
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        statusAction: "in_progress",
+        toStatus: "in_progress",
+        reasonCode: "completion_evidence_incomplete",
+      }),
+    );
+
+    const claimOnly = assessment({
+      objectiveSatisfied: false,
+      allCriteriaSatisfied: false,
+      verificationPassed: false,
+      criterionAssessments: [
+        {
+          criterionId: "objective",
+          claimStatus: "satisfied",
+          outcome: "missing",
+          evidenceRefs: [],
+          reasonCode: "criterion_evidence_missing",
+        },
+      ],
+      acceptedEvidenceRefs: [],
+      missingRequirements: ["objective"],
+    });
+
+    // 3. claimOnly with completionClaimPolicyAccepted: true AND rejectedEvidence > 0: MUST NOT transition to done
+    expect(
+      arbitrate({
+        assessment: assessment({
+          ...claimOnly,
+          rejectedEvidence: [
+            {
+              ref: "evidence:rejected-claim",
+              reason: "Claimed evidence rejected",
+            },
+          ],
+        }),
+        completionClaimPolicyAccepted: true,
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        statusAction: "in_progress",
+        toStatus: "in_progress",
+        reasonCode: "completion_evidence_incomplete",
+      }),
+    );
+
+    // 4. reviewPolicy === "server_arbiter" disallows policyClaimComplete on claimOnly even if completionClaimPolicyAccepted is true
+    expect(
+      arbitrate({
+        assessment: claimOnly,
+        completionClaimPolicyAccepted: true,
+        reviewPolicy: "server_arbiter",
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        statusAction: "in_progress",
+        toStatus: "in_progress",
+        reasonCode: "completion_evidence_incomplete",
+      }),
+    );
+
+    // 5. reviewPolicy === "server_arbiter" with fully verified evidence transitions to done with completion_contract_satisfied
+    expect(
+      arbitrate({
+        reviewPolicy: "server_arbiter",
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        statusAction: "done",
+        toStatus: "done",
+        reasonCode: "completion_contract_satisfied",
+        effects: [{ kind: "release_checkout" }],
+      }),
+    );
+
+    // 6. reviewPolicy === "server_arbiter" with completionClaimPolicyAccepted: true still resolves as completion_contract_satisfied (never completion_claim_policy_accepted)
+    expect(
+      arbitrate({
+        reviewPolicy: "server_arbiter",
+        completionClaimPolicyAccepted: true,
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        statusAction: "done",
+        toStatus: "done",
+        reasonCode: "completion_contract_satisfied",
+        effects: [{ kind: "release_checkout" }],
+      }),
+    );
+  });
+
   it("creates explicit liveness paths for review, continuation, cancellation, and governance", () => {
     expect(
       arbitrate({
