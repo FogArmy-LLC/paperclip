@@ -280,7 +280,11 @@ export function createIsolatedCodexAppServerArgs(
         )
         .map((value) => resolve(value)),
     ),
-  ];
+  ].filter((root, _index, roots) =>
+    // A masked ancestor already denies descendants. Emitting another mask below
+    // it makes bwrap mkdir inside the ancestor's read-only replacement.
+    !roots.some((parent) => codexPathInside(parent, root)),
+  );
   const filesystemRules = [
     `":root"="none"`,
     `":minimal"="read"`,

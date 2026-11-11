@@ -370,6 +370,18 @@ describe("Codex security configuration", () => {
     expect(serialized).not.toContain("must-not-cross");
   });
 
+  it("masks nested provider homes once so bwrap can construct the denied root", () => {
+    for (const source of [
+      { HOME: "/workspace/.runtime/home", CODEX_HOME: "/workspace/.runtime/home/codex" },
+      { HOME: "/workspace/.runtime/home/codex", CODEX_HOME: "/workspace/.runtime/home" },
+    ]) {
+      const args = createIsolatedCodexAppServerArgs(source).join("\n");
+      expect(args).toContain('"/workspace/.runtime/home"="none"');
+      expect(args).not.toContain('"/workspace/.runtime/home/codex"="none"');
+      expect(args).toContain('":root"="none"');
+    }
+  });
+
   it("inherits only projected GitHub credentials without serializing their values", () => {
     const args = createIsolatedCodexAppServerArgs({
       PATH: "/safe/bin",
