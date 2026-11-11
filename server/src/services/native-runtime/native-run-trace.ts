@@ -13,6 +13,9 @@ import {
 export const NATIVE_RUN_SPAN_EVENT_TYPE = "run.performance.span";
 export const NATIVE_RUN_TRACE_SCHEMA_VERSION = 3;
 
+const COMPANY_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 export type NativeRunSpanOutcome = "ok" | "failed";
 
 export interface NativeRunHistoricalSpan {
@@ -167,6 +170,9 @@ const SAFE_NATIVE_RUN_SPAN_ATTRIBUTE_KEYS = new Set([
   "stateSource",
   "strategy",
   "target",
+  "paperclip.task.run.company_id",
+  "paperclip.task.run.task_id",
+  "paperclip.task.run.run_id",
 ]);
 
 function finiteMs(value: number): number {
@@ -203,7 +209,12 @@ function safeAttributes(
  * semantic parent name for developer installs without an OTLP collector.
  */
 export function createNativeRunTrace(input: {
+  /** Trusted company binding from the server-owned run, never caller input. */
+  companyId?: string;
+  /** Trusted issue/task binding from the server-owned run. */
+  taskId?: string;
   runId: string;
+  runtime?: "paperclip_runner" | "direct_adapter";
   startedAtMs?: number;
   onEvent?: NativeRunTraceSink;
   traceContext?: StartupTraceContextHandle;
@@ -212,6 +223,14 @@ export function createNativeRunTrace(input: {
     input.traceContext ?? getStartupTraceContext("paperclip.native-runner");
   const traceStartedAtMs = finiteMs(input.startedAtMs ?? Date.now());
   const runIdHash = hashedId(input.runId);
+  const taskIdHash = input.taskId ? hashedId(input.taskId) : undefined;
+  const traceIdentityAttributes = {
+    ...(input.companyId && COMPANY_ID_PATTERN.test(input.companyId)
+      ? { "paperclip.task.run.company_id": input.companyId }
+      : {}),
+    ...(taskIdHash ? { "paperclip.task.run.task_id": taskIdHash } : {}),
+    "paperclip.task.run.run_id": runIdHash,
+  };
   let rootSpan: SpanHandle;
   try {
     const owned = getRunExecutionTraceContext(input.runId);
@@ -221,8 +240,8 @@ export function createNativeRunTrace(input: {
     rootSpan = tracing.tracer.startSpan("task.provider_session", {
       startTime: traceStartedAtMs,
       attributes: {
-        "paperclip.task.run.run_id": runIdHash,
-        "paperclip.task.run.runtime": "paperclip_runner",
+        ...traceIdentityAttributes,
+        "paperclip.task.run.runtime": input.runtime ?? "paperclip_runner",
         "paperclip.task.run.trace_schema_version":
           NATIVE_RUN_TRACE_SCHEMA_VERSION,
       },
@@ -330,7 +349,10 @@ export function createNativeRunTrace(input: {
     } = {},
   ): NativeRunSpanScope => {
     const startedAtMs = finiteMs(options.startedAtMs ?? Date.now());
-    const attributes = safeAttributes(options.attributes);
+    const attributes = safeAttributes({
+      ...traceIdentityAttributes,
+      ...options.attributes,
+    });
     const parent = parentFor(options.parentName);
     let span: SpanHandle;
     try {
@@ -339,6 +361,7 @@ export function createNativeRunTrace(input: {
         {
           startTime: startedAtMs,
           attributes: {
+            ...traceIdentityAttributes,
             "paperclip.native.span.trace_schema_version":
               NATIVE_RUN_TRACE_SCHEMA_VERSION,
             ...Object.fromEntries(
@@ -515,7 +538,10 @@ export function createNativeRunTrace(input: {
       startedAtMs: traceStartedAtMs,
       endedAtMs,
       outcome,
-      attributes: { runtime: "paperclip_runner" },
+      attributes: {
+        ...traceIdentityAttributes,
+        runtime: input.runtime ?? "paperclip_runner",
+      },
     });
   };
 

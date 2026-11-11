@@ -8581,6 +8581,8 @@ async function executePaperclipNativeSessionWithinScope(
     Date.now(),
   );
   const trace = createNativeRunTrace({
+    companyId: input.execution.binding.companyId,
+    taskId: input.execution.binding.issueId,
     runId: input.execution.binding.runId,
     startedAtMs: preparationStarts.runStartedAtMs,
     onEvent: input.onEvent,
