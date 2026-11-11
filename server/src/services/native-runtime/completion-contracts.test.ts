@@ -219,11 +219,28 @@ describe("resolveNativeCompletionPolicy", () => {
   });
 
   it("keeps completion server-authoritative when issue policy requires review", () => {
-    for (const reviewPolicy of ["human_only", "not_creator"]) {
+    for (const reviewPolicy of ["human_only", "not_creator", "server_arbiter"]) {
       expect(resolveNativeCompletionPolicy({ reviewPolicy })).toEqual({
         risk: "standard",
         completionAuthority: "server_arbiter",
       });
+    }
+  });
+
+  it("upgrades completion to server_arbiter when PAPERCLIP_STRICT_SERVER_ARBITER is set", () => {
+    const originalEnv = process.env.PAPERCLIP_STRICT_SERVER_ARBITER;
+    try {
+      process.env.PAPERCLIP_STRICT_SERVER_ARBITER = "true";
+      expect(resolveNativeCompletionPolicy({ reviewPolicy: null })).toEqual({
+        risk: "standard",
+        completionAuthority: "server_arbiter",
+      });
+    } finally {
+      if (originalEnv === undefined) {
+        delete process.env.PAPERCLIP_STRICT_SERVER_ARBITER;
+      } else {
+        process.env.PAPERCLIP_STRICT_SERVER_ARBITER = originalEnv;
+      }
     }
   });
 });

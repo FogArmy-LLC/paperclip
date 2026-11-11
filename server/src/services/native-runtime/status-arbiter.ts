@@ -98,6 +98,7 @@ export function arbitrateNativeStatus(input: {
   workspaceFinalizeStatus: "succeeded" | "failed";
   governanceGate?: NativeGovernanceGate | null;
   completionClaimPolicyAccepted?: boolean;
+  reviewPolicy?: string | null;
   /** Canonical exact-output human verdicts, only for an explicitly opted-in requirement. */
   requiredQualityReviewSatisfied?: boolean;
   allowIncompleteContinuation?: boolean;
@@ -375,17 +376,20 @@ export function arbitrateNativeStatus(input: {
     input.assessment.allCriteriaSatisfied &&
     input.assessment.verificationPassed &&
     !input.assessment.hasFailedVerification &&
+    input.assessment.rejectedEvidence.length === 0 &&
     input.assessment.attentionRequests.length === 0 &&
     !input.assessment.hasBlockingRemainingWork;
   const policyClaimComplete =
+    input.reviewPolicy !== "server_arbiter" &&
     input.completionClaimPolicyAccepted === true &&
     input.assessment.reportedDisposition === "done" &&
     input.assessment.contractRevisionMatches &&
     input.assessment.objectiveClaimSatisfied &&
     input.assessment.criterionAssessments.length > 0 &&
     input.assessment.criterionAssessments.every(
-      (entry) => entry.claimStatus === "satisfied",
+      (entry) => entry.claimStatus === "satisfied" && entry.outcome !== "rejected",
     ) &&
+    input.assessment.rejectedEvidence.length === 0 &&
     !input.assessment.hasFailedVerification &&
     input.assessment.attentionRequests.length === 0 &&
     !input.assessment.hasBlockingRemainingWork;
@@ -406,7 +410,7 @@ export function arbitrateNativeStatus(input: {
       policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
       statusAction: "done",
       toStatus: "done",
-      reasonCode: input.completionClaimPolicyAccepted
+      reasonCode: input.completionClaimPolicyAccepted && input.reviewPolicy !== "server_arbiter"
         ? "completion_claim_policy_accepted"
         : "completion_contract_satisfied",
       unblockDescriptor: null,

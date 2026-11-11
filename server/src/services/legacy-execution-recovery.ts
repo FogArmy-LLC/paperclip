@@ -9,7 +9,7 @@ import { isPreDispatchExecutionWaitVerified } from "./pre-dispatch-execution-wai
 import { REMOTE_WORKSPACE_PREPARATION_TIMEOUT_CODE } from "./remote-workspace-transport.js";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
-import { claimedAdapterType, hasConversationContinuationPolicy } from "./conversation-continuation.js";
+import { claimedAdapterType, hasConversationContinuationPolicy, isConversationAdapter, runUsedConversationAdapter } from "./conversation-continuation.js";
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, getTableColumns, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
@@ -46,7 +46,7 @@ export const legacyReconciliationRunFields = {
 
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
-  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot" | "runnerProfileJson">>,
 ): boolean {
   if (
     run.runtimeMode === "native" ||
@@ -58,6 +58,14 @@ export function legacyExecutionNeedsReconciliation(
   // A fresh conversation turn lets the agent decide what remains. The retry
   // scheduler, not an action-outcome hold, owns the automatic attempt limit.
   if (hasConversationContinuationPolicy(run.resultJson)) return false;
+  const adapterType = claimedAdapterType({ runnerProfileJson: run.runnerProfileJson ?? null });
+  const conversationInterruption =
+    run.status === "interrupted" ||
+    ["process_lost", "server_shutdown_interrupted", "execution_reconciliation_required"].includes(run.errorCode ?? "") ||
+    (run.status === "cancelled" && (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state === "acknowledged");
+  if (adapterType && isConversationAdapter(adapterType) && conversationInterruption && executionFailureRetryCount(run) < 2) {
+    return false;
+  }
   // Productive turn-budget continuation is not a failed provider session.
   if (normalizeMaxTurnStopReason(run.resultJson?.stopReason) ?? normalizeMaxTurnStopReason(run.errorCode)) return false;
   const evidence = run.resultJson?.executionRecovery as
@@ -88,9 +96,16 @@ export function legacyExecutionNeedsReconciliation(
  * The synchronous classifier stays conservative for callers without a DB proof. */
 export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run: Run): Promise<boolean> {
   if (run.status === "interrupted" && await isInterruptedNativePreparation(db, run)) return false;
-  return await hasUnrestoredRemoteWorkspace(db, run) ||
-    (legacyExecutionNeedsReconciliation(run) && !(await isPreDispatchReviewWaitVerified(db, run))
-      && !(await isPreDispatchExecutionWaitVerified(db, run)));
+  if (await hasUnrestoredRemoteWorkspace(db, run)) return true;
+  const conversationInterruption =
+    run.status === "interrupted" ||
+    ["process_lost", "server_shutdown_interrupted", "execution_reconciliation_required"].includes(run.errorCode ?? "") ||
+    (run.status === "cancelled" && (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state === "acknowledged");
+  if (conversationInterruption && executionFailureRetryCount(run) < 2 && await runUsedConversationAdapter(db, run)) {
+    return false;
+  }
+  return legacyExecutionNeedsReconciliation(run) && !(await isPreDispatchReviewWaitVerified(db, run))
+    && !(await isPreDispatchExecutionWaitVerified(db, run));
 }
 
 /** Persist the failed legacy run, owned lock release and operator decision together. */
@@ -274,6 +289,10 @@ export async function terminalizeLegacyExecution(input: {
               or(sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
                 sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`),
               sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+            ),
+            and(
+              sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+              eq(issueRecoveryActions.outcome, "cancelled"),
             ),
           ),
         )).limit(1);

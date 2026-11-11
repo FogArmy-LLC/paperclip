@@ -950,6 +950,15 @@ function isRepeatedProductiveContinuationRecovery(
   );
 }
 
+export function isBlockingCycleError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { status?: unknown }).status === 422 &&
+    (error as { message?: unknown }).message === "Blocking relations cannot contain cycles"
+  );
+}
+
 type RecoveryIssue = Omit<typeof issues.$inferSelect, "description">;
 
 const { description: _unusedIssueDescription, ...recoveryIssueFields } = getTableColumns(issues);
@@ -3591,20 +3600,34 @@ export function recoveryService(
         healthyChildren.length > 0 ||
         hasNewSourcePath
       ) {
+        let skippedHealthyChildBlockDueToCycle = false;
         if (healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
           const blockerIds = await existingUnresolvedBlockerIssueIds(
             issue.companyId,
             issue.id,
           );
-          await issuesSvc.update(issue.id, {
-            status: "blocked",
-            blockedByIssueIds: [
-              ...new Set([
-                ...blockerIds,
-                ...healthyChildren.map((child) => child.id),
-              ]),
-            ],
-          });
+          try {
+            await issuesSvc.update(issue.id, {
+              status: "blocked",
+              blockedByIssueIds: [
+                ...new Set([
+                  ...blockerIds,
+                  ...healthyChildren.map((child) => child.id),
+                ]),
+              ],
+            });
+          } catch (error) {
+            if (!isBlockingCycleError(error)) throw error;
+            skippedHealthyChildBlockDueToCycle = true;
+            logger.warn(
+              {
+                issueId: issue.id,
+                actionId: action.id,
+                healthyChildIds: healthyChildren.map((child) => child.id),
+              },
+              "reconcileActiveRecoveryActions: skipped blocking link due to cycle; resolving active recovery action",
+            );
+          }
         }
         const resolved = await recoveryActionsSvc.resolveActiveForIssue({
           companyId: action.companyId,
@@ -3615,7 +3638,9 @@ export function recoveryService(
           resolutionNote: durablePathRestored
             ? `durable_path_restored:${sourceState.durablePathReason ?? "unknown"}`
             : healthyChildren.length > 0
-              ? "durable_path_restored:healthy_child"
+              ? skippedHealthyChildBlockDueToCycle
+                ? "durable_path_restored:healthy_child_cycle_guarded"
+                : "durable_path_restored:healthy_child"
               : "new_source_execution_path",
         });
         if (resolved) {

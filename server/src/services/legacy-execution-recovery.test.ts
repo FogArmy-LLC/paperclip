@@ -107,3 +107,112 @@ it("recognizes only an unclaimed pre-dispatch review wait receipt", () => {
     { resultJson: { ...run.resultJson, workspaceRestoreFailure: "restore_unsafe_archive" } },
   ]) expect(isPreDispatchReviewWait({ ...run, ...patch })).toBe(false);
 });
+
+it.each(["codex_local", "claude_local", "cursor", "gemini_local"])(
+  "exempts %s conversation adapter runs interrupted with retry count < 2 even with null resultJson",
+  (adapterType) => {
+    const interruptedRun = {
+      runtimeMode: "legacy",
+      status: "interrupted",
+      errorCode: "server_shutdown_interrupted",
+      resultJson: null,
+      scheduledRetryAttempt: 0,
+      runnerProfileJson: {
+        adapterDispatch: { adapterType },
+      },
+    };
+    expect(legacyExecutionNeedsReconciliation(interruptedRun)).toBe(false);
+
+    // Also with retry attempt 1
+    expect(
+      legacyExecutionNeedsReconciliation({
+        ...interruptedRun,
+        scheduledRetryAttempt: 1,
+      }),
+    ).toBe(false);
+
+    // Also with process_lost
+    expect(
+      legacyExecutionNeedsReconciliation({
+        ...interruptedRun,
+        errorCode: "process_lost",
+      }),
+    ).toBe(false);
+
+    // Also with execution_reconciliation_required
+    expect(
+      legacyExecutionNeedsReconciliation({
+        ...interruptedRun,
+        status: "failed",
+        errorCode: "execution_reconciliation_required",
+      }),
+    ).toBe(false);
+
+    // Also with acknowledged cancelled status
+    expect(
+      legacyExecutionNeedsReconciliation({
+        ...interruptedRun,
+        status: "cancelled",
+        errorCode: "cancelled",
+        resultJson: { executionCancellation: { state: "acknowledged" } },
+      }),
+    ).toBe(false);
+  },
+);
+
+it("holds conversation adapter runs once retry count reaches or exceeds 2", () => {
+  const exhaustedRun = {
+    runtimeMode: "legacy",
+    status: "interrupted",
+    errorCode: "server_shutdown_interrupted",
+    resultJson: null,
+    scheduledRetryAttempt: 2,
+    runnerProfileJson: {
+      adapterDispatch: { adapterType: "codex_local" },
+    },
+  };
+  expect(legacyExecutionNeedsReconciliation(exhaustedRun)).toBe(true);
+});
+
+it.each(["process", "webhook", "generic"])(
+  "holds non-conversation adapter %s runs on interruption even with retry count < 2",
+  (adapterType) => {
+    const nonConversationRun = {
+      runtimeMode: "legacy",
+      status: "interrupted",
+      errorCode: "server_shutdown_interrupted",
+      resultJson: null,
+      scheduledRetryAttempt: 0,
+      runnerProfileJson: {
+        adapterDispatch: { adapterType },
+      },
+    };
+    expect(legacyExecutionNeedsReconciliation(nonConversationRun)).toBe(true);
+  },
+);
+
+it("holds runs without runnerProfileJson or adapterDispatch on interruption", () => {
+  const unknownRun = {
+    runtimeMode: "legacy",
+    status: "interrupted",
+    errorCode: "server_shutdown_interrupted",
+    resultJson: null,
+    scheduledRetryAttempt: 0,
+    runnerProfileJson: null,
+  };
+  expect(legacyExecutionNeedsReconciliation(unknownRun)).toBe(true);
+});
+
+it("holds unsafe workspace archives even for conversation adapters with retry count < 2", () => {
+  const unsafeRun = {
+    runtimeMode: "legacy",
+    status: "interrupted",
+    errorCode: "server_shutdown_interrupted",
+    resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" },
+    scheduledRetryAttempt: 0,
+    runnerProfileJson: {
+      adapterDispatch: { adapterType: "codex_local" },
+    },
+  };
+  expect(legacyExecutionNeedsReconciliation(unsafeRun)).toBe(true);
+});

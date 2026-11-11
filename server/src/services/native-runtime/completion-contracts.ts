@@ -81,7 +81,10 @@ export function resolveNativeCompletionPolicy(issue: {
   reviewPolicy?: string | null;
 }) {
   const externalReviewRequired =
-    issue.reviewPolicy === "human_only" || issue.reviewPolicy === "not_creator";
+    issue.reviewPolicy === "human_only" ||
+    issue.reviewPolicy === "not_creator" ||
+    issue.reviewPolicy === "server_arbiter" ||
+    process.env.PAPERCLIP_STRICT_SERVER_ARBITER === "true";
   return externalReviewRequired
     ? { risk: "standard", completionAuthority: "server_arbiter" } as const
     : { risk: "low", completionAuthority: "agent_claim_policy" } as const;
