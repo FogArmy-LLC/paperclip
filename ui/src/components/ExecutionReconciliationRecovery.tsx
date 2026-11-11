@@ -17,7 +17,7 @@ export function ExecutionReconciliationRecovery({ issueId, companyId, action, ca
   const [outcome, setOutcome] = useState<ExecutionReconciliation["actionOutcome"] | "">("");
   const [evidence, setEvidence] = useState("");
   const [workspaceEvidence, setWorkspaceEvidence] = useState("");
-  const runId = action?.evidence.runId ?? action?.evidence.sourceRunId;
+  const runId = action?.evidence?.runId ?? action?.evidence?.sourceRunId;
   const eligible = Boolean(action && action.companyId === companyId && action.sourceIssueId === issueId
     && action.ownerType === "board" && (["active", "escalated"].includes(action.status)
       || (action.status === "resolved" && !action.evidence.executionReconciliation && (action.evidence.automaticRecovery as { replay?: string } | undefined)?.replay === "blocked"))

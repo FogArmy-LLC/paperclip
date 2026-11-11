@@ -66,6 +66,7 @@ const mockIssuesApi = vi.hoisted(() => ({
   markRead: vi.fn(),
   update: vi.fn(),
   resolveRecoveryAction: vi.fn(),
+  recoveryActions: vi.fn(),
   previewTreeControl: vi.fn(),
   getTreeControlState: vi.fn(),
   listTreeHolds: vi.fn(),
@@ -1328,6 +1329,7 @@ describe("IssueDetail", () => {
     } as Response);
 
     mockIssuesApi.list.mockResolvedValue([]);
+    mockIssuesApi.recoveryActions.mockResolvedValue({active:null,actions:[]});
     mockIssuesApi.listAll.mockImplementation((...args) => mockIssuesApi.list(...args));
     mockIssuesApi.listComments.mockResolvedValue([]);
     mockIssuesApi.listAttachments.mockResolvedValue([]);
@@ -2538,6 +2540,7 @@ describe("IssueDetail", () => {
   it("hides the full sub-task tree when the task has no subtasks", async () => {
     mockIssuesApi.get.mockResolvedValue(createIssue());
     mockIssuesApi.list.mockResolvedValue([]);
+    mockIssuesApi.recoveryActions.mockResolvedValue({active:null,actions:[]});
 
     await act(async () => {
       root.render(
