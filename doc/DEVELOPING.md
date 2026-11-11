@@ -595,6 +595,16 @@ Activity-only reorderings wait for one second without further activity changes;
 new and removed tasks appear immediately. Titles, status, and live indicators stay
 current during that delay.
 
+### Codex managed-home sandbox masks
+
+The native Codex permission factory denies provider `HOME` and `CODEX_HOME` to
+shell commands. When one is nested below the other, emit only the ancestor's
+deny rule. The ancestor already denies the child; a redundant child mask makes
+bubblewrap create a mount target inside an already read-only replacement and
+prevents workspace commands from starting. This applies to both execution and
+planning profiles. It does not grant read access to either provider home or
+change workspace, network, or model-account policy.
+
 ### OpenCode native runtime
 
 Paperclip Runner resolves the pinned OpenCode platform package installed with
