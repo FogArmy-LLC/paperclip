@@ -3,6 +3,7 @@ import { isLockedIssueStub, LockedIssueChip } from "@/components/LockedIssueChip
 import { canManageIssuePrivacy } from "../lib/issuePrivacy";
 import { TextAttachmentContext } from "../context/TextAttachmentContext";
 import { useTaskBrowsers, useBrowserArrivals } from "@/hooks/useTaskBrowsers";
+import { ExecutionReconciliationRecovery } from "../components/ExecutionReconciliationRecovery";
 import { WorkspaceExportRecovery } from "../components/WorkspaceExportRecovery";
 import { DispositionRecoveryProvider } from "../components/DispositionRecoveryNotice";
 import { AgentAvatar } from "@/components/AgentAvatar";
@@ -7655,6 +7656,10 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               className={shellSectionClass}
               action={issue.activeRecoveryAction ?? null} canManage={canManageBoardRuntime} onQueued={invalidateIssueDetail} />
           )}
+          {resolvedDetailTab === "chat" && <ExecutionReconciliationRecovery
+            key={`execution-reconciliation:${issue.activeRecoveryAction?.id}:${issue.activeRecoveryAction?.updatedAt}`}
+            issueId={issue.id} companyId={issue.companyId} action={issue.activeRecoveryAction ?? null}
+            canManage={canManageBoardRuntime} onRecorded={invalidateIssueDetail} className={shellSectionClass} />}
           {resolvedDetailTab === "chat" && issue.executionBlocker && (
             <ExecutionBlockerNotice className={shellSectionClass} companyId={issue.companyId} issueId={issue.id} blocker={issue.executionBlocker} onRetried={invalidateIssueDetail} />
           )}
