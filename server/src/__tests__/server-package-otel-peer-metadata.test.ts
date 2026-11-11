@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 /**
- * The seven OpenTelemetry packages `server/src/instrumentation.ts` loads
+ * The eight OpenTelemetry packages `server/src/instrumentation.ts` loads
  * through a dynamic import. Each one must be an optional peer dependency, not
  * a normal dependency, so a default install never pulls in the SDK. This test
  * guards the manifest half of that contract; `instrumentation.test.ts` guards
@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 
 const OPTIONAL_OTEL_PACKAGES = [
   "@opentelemetry/sdk-node",
+  "@opentelemetry/sdk-trace-base",
   "@opentelemetry/auto-instrumentations-node",
   "@opentelemetry/resources",
   "@opentelemetry/semantic-conventions",

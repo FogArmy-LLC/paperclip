@@ -1,3 +1,4 @@
+import { isolateNativeSpanQueue } from "./native-span-queue.js";
 // Optional OpenTelemetry auto-instrumentation for HTTP / Express / PG / …
 //
 // Activated only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. When unset, no
@@ -291,6 +292,7 @@ export function recordProviderPluginSpan(input: {
  */
 const OTEL_COMMON_PACKAGES = [
   "@opentelemetry/sdk-node",
+  "@opentelemetry/sdk-trace-base",
   "@opentelemetry/auto-instrumentations-node",
   "@opentelemetry/resources",
   "@opentelemetry/semantic-conventions",
@@ -462,7 +464,7 @@ async function bootstrapOtel(endpoint: string): Promise<void> {
   try {
     // Dynamic imports so type-resolution doesn't require the packages to
     // be installed unless the operator actually opts in.
-    const [sdkNode, autoInstr, traceExporter, resources, semconv] =
+    const [sdkNode, autoInstr, traceExporter, resources, semconv, traceBase] =
       await Promise.all([
         // @ts-ignore optional peer dep
         import("@opentelemetry/sdk-node"),
@@ -473,6 +475,8 @@ async function bootstrapOtel(endpoint: string): Promise<void> {
         import("@opentelemetry/resources"),
         // @ts-ignore optional peer dep
         import("@opentelemetry/semantic-conventions"),
+        // @ts-ignore optional peer dep
+        import("@opentelemetry/sdk-trace-base"),
       ]);
 
     const { NodeSDK } = sdkNode;
@@ -490,6 +494,9 @@ async function bootstrapOtel(endpoint: string): Promise<void> {
     // eslint-disable-next-line no-console
     console.log(`[paperclip] OpenTelemetry service.version=${serviceVersion}`);
 
+    const createExporter = () => protocol === "grpc"
+      ? new OTLPTraceExporter({ url: endpoint })
+      : new OTLPTraceExporter();
     const sdk = new NodeSDK({
       resource: resourceFromAttributes({
         [ATTR_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME || "paperclip",
@@ -505,9 +512,12 @@ async function bootstrapOtel(endpoint: string): Promise<void> {
       // `SpanExporter` breaks the compile when the optional packages are
       // absent. Cast to `never` instead: `never` is assignable to
       // `SpanExporter` and needs no import.
-      traceExporter: (protocol === "grpc"
-        ? new OTLPTraceExporter({ url: endpoint })
-        : new OTLPTraceExporter()) as never,
+      // Independent stock bounded queues prevent automatic spans (which are
+      // later rejected by company filtering) from starving native evidence.
+      // Each queue owns its exporter, so shutdown is independent and idempotent.
+      spanProcessors: [isolateNativeSpanQueue(() =>
+        new traceBase.BatchSpanProcessor(createExporter() as never) as never,
+      ) as never],
       instrumentations: [
         getNodeAutoInstrumentations({
           // Too chatty for this workload.
