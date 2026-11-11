@@ -1364,3 +1364,32 @@ PostgreSQL benchmark with 114 mixed skills and at least 400 remote files. It
 reports one cold sample and ten warm samples (one in a new process), refresh and
 fetch counts, rebuilds, missing entries, and content checks. Upstream responses are
 deterministic fixtures; use real deployed run spans for user-facing latency.
+
+
+### Follow-through evidence
+
+Native run spans include a stable hashed task reference when the execution binding
+contains a valid task UUID. Native authority tool spans include a hashed call
+reference, a catalog operation name, and `returned`, `tool_error`, or `threw`.
+A returned MCP `isError` result is a failed tool span even when it does not throw.
+External CLI adapter tools do not yet expose this authority wrapper; their run
+spans must not be presented as complete per-tool coverage.
+
+Activity publication emits bounded `task.follow_through` spans for native status
+decisions, checkout acknowledgements, SLA requests, handoffs, and recovery records.
+`persistActivity` does not export spans. Transactional callers must defer
+`publishActivity` until commit, as the native status decision committer does.
+Callers that publish inside a transaction can produce observations before commit;
+these records alone are not proof of a committed delivery transition.
+Completion-review resolution records the actual verdict and whether its resolver
+is distinct from its creator. This is separate from business acceptance.
+All projected records keep `acceptance=unverified`. A status, queue receipt,
+continuation resolution, or review verdict must not establish deployed delivery.
+Original SLA timestamps and explicit false ACK/result fields remain unchanged.
+
+The operator collector must retain the bounded correlation attributes. It must
+filter company identity before scrubbing. Task, run, call, activity, and decision
+references use the existing SHA256-prefix convention, not raw identifiers.
+Comments, prompts, tool inputs/results, free-text reasons, and URLs are excluded.
+This path remains opt-in operator observability and does not depend on first-party
+telemetry consent. It adds no scheduler, recovery authority, or delivery actuator.

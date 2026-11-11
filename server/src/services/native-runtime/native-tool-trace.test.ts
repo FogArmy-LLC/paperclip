@@ -72,3 +72,18 @@ describe("native tool timing", () => {
     expect(spans.filter((span) => span.span === "tool.request.input_stream").map((span) => span.durationMs)).toEqual([10, 31]);
   });
 });
+
+it("marks an MCP error result failed while preserving the exact return value", async () => {
+  const { spans, timing } = fixture();
+  const result = { isError: true, content: [{ type: "text", text: "private denied detail" }] };
+  expect(await timing.execute({ callId: "call-123", tool: "call_api" }, async () => result)).toBe(result);
+  expect(spans[0]).toMatchObject({ outcome: "failed", result_state: "tool_error", call_id: expect.stringMatching(/^[a-f0-9]{12}$/) });
+  expect(JSON.stringify(spans)).not.toContain("private denied detail");
+});
+
+it.each([{ ok: false, status: 403 }, { outcome: "failed", code: "runner_bridge_invalid_arguments" }, { outcome: "unknown", error: "api_outcome_unknown" }])("does not turn a native error/unknown receipt into success: %j", async (result) => {
+  const { spans, timing } = fixture();
+  expect(await timing.execute({ callId: "native-call", tool: "call_api" }, async () => result)).toBe(result);
+  expect(spans[0]).toMatchObject({ outcome: "failed", result_state: result.outcome === "unknown" ? "outcome_unknown" : "tool_error" });
+  expect(JSON.stringify(spans)).not.toContain("api_outcome_unknown");
+});

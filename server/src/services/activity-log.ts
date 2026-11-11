@@ -11,6 +11,7 @@ import { redactCurrentUserValue } from "../log-redaction.js";
 import { sanitizeRecord } from "../redaction.js";
 import { logger } from "../middleware/logger.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
+import { emitFollowThrough } from "./follow-through-trace.js";
 import { instanceSettingsService } from "./instance-settings.js";
 
 const PLUGIN_EVENT_SET: ReadonlySet<string> = new Set(PLUGIN_EVENT_TYPES);
@@ -146,6 +147,7 @@ export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActi
 }
 
 export function publishActivity(publication: ActivityPublication) {
+  emitFollowThrough(publication);
   publishLiveEvent({
     companyId: publication.companyId,
     type: "activity.logged",
@@ -171,6 +173,7 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
   }).returning({ id: activityLog.id });
 
   const payload = {
+    activityId: activity.id,
     issueId: input.issueId ?? (input.entityType === "issue" ? input.entityId : null),
     actorType: input.actorType,
     actorId: input.actorId,
