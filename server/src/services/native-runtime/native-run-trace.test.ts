@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 
 import type { AdapterRuntimeEvent } from "../../adapters/index.js";
@@ -369,6 +370,109 @@ describe("native runner performance trace", () => {
       trace.measure("runner.turn.submit", async () => "ok"),
     ).resolves.toBe("ok");
     await expect(trace.finish("ok")).resolves.toBeUndefined();
+  });
+
+  it.each(["ok", "failed"] as const)(
+    "keeps direct-adapter identity on root and child for %s completion",
+    async outcome => {
+      const companyId = "018f4d2a-7c91-7abc-8def-0123456789ab";
+      const taskId = "018f4d2a-7c91-7abc-8def-0123456789ac";
+      const runId = "direct-adapter-run";
+      const { traceContext, spans } = createRecordingTraceContext();
+      const trace = createNativeRunTrace({
+        companyId,
+        taskId,
+        runId,
+        runtime: "direct_adapter",
+        traceContext,
+      });
+      const execution = trace.start("adapter.execute", {
+        attributes: { runtime: "direct_adapter", adapter: "codex_local" },
+      });
+      await trace.end(execution, { outcome });
+      await trace.finish(outcome);
+
+      const hash = (value: string) =>
+        createHash("sha256").update(value).digest("hex").slice(0, 12);
+      expect(spans.length).toBeGreaterThanOrEqual(2);
+      for (const span of spans) {
+        expect(span.attributes).toMatchObject({
+          "paperclip.task.run.company_id": companyId,
+          "paperclip.task.run.task_id": hash(taskId),
+          "paperclip.task.run.run_id": hash(runId),
+        });
+      }
+      expect(
+        spans.find(span => span.name === "adapter.execute")?.attributes,
+      ).toMatchObject({
+        "paperclip.native.span.outcome": outcome,
+        "paperclip.native.span.runtime": "direct_adapter",
+      });
+    },
+  );
+
+  it("omits the company binding when the trusted company identity is invalid", async () => {
+    const { traceContext, spans } = createRecordingTraceContext();
+    const trace = createNativeRunTrace({
+      companyId: "not-a-company-id",
+      taskId: "task-id",
+      runId: "run-id",
+      traceContext,
+    });
+    const child = trace.start("native.child");
+    await trace.end(child);
+    await trace.finish("ok");
+    expect(spans.every(span =>
+      !Object.hasOwn(span.attributes, "paperclip.task.run.company_id"),
+    )).toBe(true);
+    expect(spans.every(span =>
+      span.attributes["paperclip.task.run.task_id"] ===
+        createHash("sha256").update("task-id").digest("hex").slice(0, 12),
+    )).toBe(true);
+  });
+
+  it("does not allow child attributes to replace server-owned trace identity", async () => {
+    const companyId = "018f4d2a-7c91-7abc-8def-0123456789ab";
+    const taskId = "018f4d2a-7c91-7abc-8def-0123456789ac";
+    const runId = "trusted-run";
+    const { traceContext, spans } = createRecordingTraceContext();
+    const events: Array<Record<string, unknown>> = [];
+    const trace = createNativeRunTrace({
+      companyId,
+      taskId,
+      runId,
+      traceContext,
+      onEvent: async event => {
+        events.push(event.payload as Record<string, unknown>);
+      },
+    });
+    const child = trace.start("adapter.execute", {
+      attributes: {
+        "paperclip.task.run.company_id": "018f4d2a-7c91-7abc-8def-0123456789ff",
+        "paperclip.task.run.task_id": "spoofed-task",
+        "paperclip.task.run.run_id": "spoofed-run",
+      },
+    });
+    trace.annotate(child, {
+      "paperclip.task.run.company_id": "018f4d2a-7c91-7abc-8def-0123456789ee",
+      "paperclip.task.run.task_id": "annotated-task",
+      "paperclip.task.run.run_id": "annotated-run",
+    });
+    await trace.end(child);
+    await trace.finish("ok");
+
+    const hash = (value: string) =>
+      createHash("sha256").update(value).digest("hex").slice(0, 12);
+    const trustedIdentity = {
+      "paperclip.task.run.company_id": companyId,
+      "paperclip.task.run.task_id": hash(taskId),
+      "paperclip.task.run.run_id": hash(runId),
+    };
+    for (const span of spans) {
+      expect(span.attributes).toMatchObject(trustedIdentity);
+    }
+    expect(events.find(event => event.span === "adapter.execute"))
+      .toMatchObject(trustedIdentity);
   });
 
   it("creates a foldable canonical hierarchy with real parent contexts", async () => {

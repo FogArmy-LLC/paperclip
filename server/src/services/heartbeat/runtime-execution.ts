@@ -66,6 +66,7 @@ import {
 import {
   buildNativeHeartbeatPreparationSpans,
   buildNativeWakeIngressSpan,
+  createNativeRunTrace,
 } from "../native-runtime/native-run-trace.js";
 import { PROVIDER_TRACE_MAX_BYTES } from "../provider-trace-store.js";
 import type { AdapterExecutionResult } from "../../adapters/index.js";
@@ -842,86 +843,105 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         await dispatchWithTiming(
           (markDispatchStarted) => {
             input.effects.onLegacyAdapterEntered();
-            return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
-              getFreshSessionHandoff,
-              agentIdentity,
-              observability,
+            const directTrace = createNativeRunTrace({
+              companyId: agent.companyId,
+              taskId: issueRef?.id,
               runId: run.id,
-              agent,
-              runtime: runtimeForAdapter,
-              config: runtimeConfig,
-              context: adapterContext,
-              executionContinuation: executionContinuation ?? null,
-              runtimeCommandSpec:
-                adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
-              executionTarget,
-              executionTransport: remoteExecution
-                ? {
-                    remoteExecution: remoteExecution as unknown as Record<
-                      string,
-                      unknown
-                    >,
-                  }
-                : undefined,
-              runtimeMcp,
-              runtimeTools,
-              onLog,
-              onMeta: onAdapterMeta,
+              runtime: "direct_adapter",
+              startedAtMs: Date.now(),
               onEvent: onAdapterEvent,
-              onUsage: usageRecorder ? async receipt => { await usageRecorder.capture(receipt); } : undefined,
-              onExecutionPhase: executionControl.phases.enter,
-              startupTraceContext: getStartupTraceContext(),
-              onRuntimeProgress: async (progress) => {
-                await recordCurrentHeartbeatRunRuntimeProgress(
-                  run,
-                  progress,
-                  issueId,
-                );
-              },
-              onProviderStopped: collectStoppedInstructions,
-              onDispatch: markDispatchStarted,
-              signal: executionControl.controller.signal,
-              ...(executionTarget?.kind === "remote" && executionTarget.transport === "sandbox" ? {
-                stopRemoteStartup: async () => {
-                  // Scope comes from the running host invocation, never agent
-                  // config. Keep adapter ownership until setup has unwound.
-                  if (!executionControl.controller.signal.aborted) {
-                    throw new Error("Remote startup stop requires a cancelled run");
-                  }
-                  const release = await envOrchestrator.releaseForRun({
-                    heartbeatRunId: run.id,
-                    companyId: agent.companyId,
-                    agentId: agent.id,
-                    status: "released",
-                    providerResourceDisposition: "stop_and_retain",
-                    cancelActiveWork: true,
-                  });
-                  if (release.errors.length || !await remoteExecutionHasStopped(db, agent.companyId, run.id)) {
-                    throw new Error("Could not verify remote startup stopped");
-                  }
-                },
-              } : {}),
-              onCancellationReady: async () => {
-                await registerAdapterExecutionControl(run.id, executionControl);
-                const current = await getRun(run.id);
-                if (!current || isHeartbeatRunTerminalStatus(current.status)) {
-                  executionControl.controller.abort(new Error("Run stopped before provider startup"));
-                }
-              },
-              onSpawn: async (meta) => {
-                markDispatchStarted();
-                await persistRunProcessMetadata(run.id, {
-                  pid: meta.pid,
-                  processGroupId:
-                    "processGroupId" in meta &&
-                    typeof meta.processGroupId === "number"
-                      ? meta.processGroupId
-                      : null,
-                  startedAt: meta.startedAt,
-                });
-              },
-              authToken: authToken ?? undefined,
-            }));
+              traceContext: getStartupTraceContext(),
+            });
+            return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", async () => {
+              let outcome: "ok" | "failed" = "ok";
+              try {
+                return await directTrace.measure("adapter.execute", () => adapter.execute({
+                  getFreshSessionHandoff,
+                  agentIdentity,
+                  observability,
+                  runId: run.id,
+                  agent,
+                  runtime: runtimeForAdapter,
+                  config: runtimeConfig,
+                  context: adapterContext,
+                  executionContinuation: executionContinuation ?? null,
+                  runtimeCommandSpec:
+                    adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
+                  executionTarget,
+                  executionTransport: remoteExecution
+                    ? {
+                        remoteExecution: remoteExecution as unknown as Record<
+                          string,
+                          unknown
+                        >,
+                      }
+                    : undefined,
+                  runtimeMcp,
+                  runtimeTools,
+                  onLog,
+                  onMeta: onAdapterMeta,
+                  onEvent: onAdapterEvent,
+                  onUsage: usageRecorder ? async receipt => { await usageRecorder.capture(receipt); } : undefined,
+                  onExecutionPhase: executionControl.phases.enter,
+                  startupTraceContext: getStartupTraceContext(),
+                  onRuntimeProgress: async (progress) => {
+                    await recordCurrentHeartbeatRunRuntimeProgress(
+                      run,
+                      progress,
+                      issueId,
+                    );
+                  },
+                  onProviderStopped: collectStoppedInstructions,
+                  onDispatch: markDispatchStarted,
+                  signal: executionControl.controller.signal,
+                  ...(executionTarget?.kind === "remote" && executionTarget.transport === "sandbox" ? {
+                    stopRemoteStartup: async () => {
+                      // Scope comes from the running host invocation, never agent
+                      // config. Keep adapter ownership until setup has unwound.
+                      if (!executionControl.controller.signal.aborted) {
+                        throw new Error("Remote startup stop requires a cancelled run");
+                      }
+                      const release = await envOrchestrator.releaseForRun({
+                        heartbeatRunId: run.id,
+                        companyId: agent.companyId,
+                        agentId: agent.id,
+                        status: "released",
+                        providerResourceDisposition: "stop_and_retain",
+                        cancelActiveWork: true,
+                      });
+                      if (release.errors.length || !await remoteExecutionHasStopped(db, agent.companyId, run.id)) {
+                        throw new Error("Could not verify remote startup stopped");
+                      }
+                    },
+                  } : {}),
+                  onCancellationReady: async () => {
+                    await registerAdapterExecutionControl(run.id, executionControl);
+                    const current = await getRun(run.id);
+                    if (!current || isHeartbeatRunTerminalStatus(current.status)) {
+                      executionControl.controller.abort(new Error("Run stopped before provider startup"));
+                    }
+                  },
+                  onSpawn: async (meta) => {
+                    markDispatchStarted();
+                    await persistRunProcessMetadata(run.id, {
+                      pid: meta.pid,
+                      processGroupId:
+                        "processGroupId" in meta &&
+                        typeof meta.processGroupId === "number"
+                          ? meta.processGroupId
+                          : null,
+                      startedAt: meta.startedAt,
+                    });
+                  },
+                  authToken: authToken ?? undefined,
+                }), { attributes: { runtime: "direct_adapter", adapter: agent.adapterType } });
+              } catch (error) {
+                outcome = "failed";
+                throw error;
+              } finally {
+                await directTrace.finish(outcome);
+              }
+            });
           },
         );
       if (!guardedDispatch.dispatched) return { dispatched: false };
