@@ -4,9 +4,9 @@ import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { IssueRecoveryAction } from "@paperclipai/shared";
-import { ExecutionReconciliationRecovery } from "./ExecutionReconciliationRecovery";
-const mocks = vi.hoisted(() => ({ resolve: vi.fn(), recorded: vi.fn() }));
-vi.mock("../api/issues", () => ({ issuesApi: { resolveRecoveryAction: mocks.resolve } }));
+import { ExecutionReconciliationRecovery, ExecutionReconciliationHistory } from "./ExecutionReconciliationRecovery";
+const mocks = vi.hoisted(() => ({ resolve: vi.fn(), recorded: vi.fn(), history: vi.fn() }));
+vi.mock("../api/issues", () => ({ issuesApi: { resolveRecoveryAction: mocks.resolve, recoveryActions: mocks.history } }));
 const runId = "e75eef64-4dcf-407e-bebd-860733847362";
 const action = { id: "action", companyId: "company", sourceIssueId: "issue", ownerType: "board", status: "escalated",
   cause: "legacy_execution_requires_reconciliation", evidence: { runId } } as unknown as IssueRecoveryAction;
@@ -52,4 +52,24 @@ it('rejects incomplete or stale response receipts', async () => {
   mocks.resolve.mockResolvedValue({issue:{id:'issue',companyId:'other'},recoveryAction:{id:'action',status:'resolved'}});
   await render(); await fill(); await act(async () => { container.querySelector('button')!.click(); await new Promise(r => setTimeout(r, 0)); });
   expect(container.querySelector('[role="alert"]')?.textContent).toContain('receipt changed'); expect(mocks.recorded).not.toHaveBeenCalled();
+});
+it('exposes only a retained resolved replay-blocked source for explicit reconciliation', async () => {
+  await render(true, {...action, status:'resolved', evidence:{runId, automaticRecovery:{replay:'blocked'}}} as IssueRecoveryAction);
+  expect(container.querySelector('button')!.disabled).toBe(true);
+  await fill();
+  await act(async () => {container.querySelector('button')!.click(); await new Promise(r=>setTimeout(r,0));});
+  expect(mocks.resolve.mock.calls[0][1].actionId).toBe('action');
+  expect(mocks.recorded).toHaveBeenCalledOnce();
+});
+
+it('reads retained history but does not offer it beside another active action', async () => {
+  const retained = {...action, status:'resolved', evidence:{runId, automaticRecovery:{replay:'blocked'}}};
+  mocks.history.mockResolvedValue({active:null,actions:[retained]});
+  await act(async () => {root.render(<QueryClientProvider client={client}><ExecutionReconciliationHistory issueId="issue" companyId="company" activeAction={null} canManage onRecorded={mocks.recorded}/></QueryClientProvider>); await new Promise(r=>setTimeout(r,20));});
+  await act(async()=>{await new Promise(r=>setTimeout(r,20));});
+  expect(container.textContent).toContain(runId);
+  mocks.history.mockResolvedValue({active:{...action,cause:'deliberate_wait_without_target'},actions:[retained]});
+  await act(async()=>{await client.invalidateQueries(); await new Promise(r=>setTimeout(r,20));});
+  expect(container.textContent).not.toContain(runId);
+  expect(mocks.resolve).not.toHaveBeenCalled();
 });

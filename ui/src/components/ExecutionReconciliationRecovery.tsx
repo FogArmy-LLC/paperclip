@@ -1,5 +1,5 @@
 import { useId, useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { requiresExecutionReconciliation, type IssueRecoveryAction, type ExecutionReconciliation } from "@paperclipai/shared";
 import { issuesApi } from "../api/issues";
 import { cn } from "../lib/utils";
@@ -19,7 +19,8 @@ export function ExecutionReconciliationRecovery({ issueId, companyId, action, ca
   const [workspaceEvidence, setWorkspaceEvidence] = useState("");
   const runId = action?.evidence.runId ?? action?.evidence.sourceRunId;
   const eligible = Boolean(action && action.companyId === companyId && action.sourceIssueId === issueId
-    && action.ownerType === "board" && ["active", "escalated"].includes(action.status)
+    && action.ownerType === "board" && (["active", "escalated"].includes(action.status)
+      || (action.status === "resolved" && (action.evidence.automaticRecovery as { replay?: string } | undefined)?.replay === "blocked"))
     && requiresExecutionReconciliation(action.cause) && typeof runId === "string"
     && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId));
   const ready = eligible && canManage && stopped && outcome !== "" && evidence.trim().length >= 20;
@@ -58,4 +59,15 @@ export function ExecutionReconciliationRecovery({ issueId, companyId, action, ca
     {save.isError && <p role="alert">{save.error instanceof Error ? save.error.message : "Reconciliation failed."}</p>}
     {save.isSuccess && <p role="status">Reconciliation recorded. Inspect the next run and its accepted return.</p>}
   </section>;
+}
+
+/** Read retained source holds through the existing access-checked endpoint. Never choose an arbitrary run. */
+export function ExecutionReconciliationHistory(props: Omit<Parameters<typeof ExecutionReconciliationRecovery>[0], "action"> & { activeAction: IssueRecoveryAction | null }) {
+  const history = useQuery({ queryKey: ["execution-reconciliation-history", props.companyId, props.issueId, props.activeAction?.id],
+    queryFn: () => issuesApi.recoveryActions(props.issueId), enabled: props.canManage });
+  if (history.isError) return <p role="alert">Recovery history could not be read. Refresh before reconciling.</p>;
+  const active = history.data?.active ?? props.activeAction;
+  const actions = active ? [active] : (history.data?.actions ?? []).filter(action => action.status === "resolved"
+    && (action.evidence.automaticRecovery as { replay?: string } | undefined)?.replay === "blocked");
+  return <>{actions.map(action => <ExecutionReconciliationRecovery key={`${action.id}:${action.updatedAt}`} {...props} action={action} />)}</>;
 }
