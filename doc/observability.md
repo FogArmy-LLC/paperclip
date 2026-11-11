@@ -1393,3 +1393,14 @@ references use the existing SHA256-prefix convention, not raw identifiers.
 Comments, prompts, tool inputs/results, free-text reasons, and URLs are excluded.
 This path remains opt-in operator observability and does not depend on first-party
 telemetry consent. It adds no scheduler, recovery authority, or delivery actuator.
+
+### Native evidence queue isolation
+
+Company-attributed native spans and unscoped automatic spans use separate stock
+`BatchSpanProcessor` queues. Each queue keeps the SDK's bounded defaults and owns
+its exporter to the same operator-selected endpoint. This doubles the maximum
+buffered span count from 2048 to 4096 with default settings; it does not guarantee
+lossless export during a native-span burst or an exporter outage. The collector's
+company validation and closed attribute projection remain authoritative. Missing
+spans remain UNKNOWN, never evidence that work succeeded. The optional peer set
+includes `@opentelemetry/sdk-trace-base` at the pinned server manifest version.
