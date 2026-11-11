@@ -431,6 +431,50 @@ describe("native runner performance trace", () => {
     )).toBe(true);
   });
 
+  it("does not allow child attributes to replace server-owned trace identity", async () => {
+    const companyId = "018f4d2a-7c91-7abc-8def-0123456789ab";
+    const taskId = "018f4d2a-7c91-7abc-8def-0123456789ac";
+    const runId = "trusted-run";
+    const { traceContext, spans } = createRecordingTraceContext();
+    const events: Array<Record<string, unknown>> = [];
+    const trace = createNativeRunTrace({
+      companyId,
+      taskId,
+      runId,
+      traceContext,
+      onEvent: async event => {
+        events.push(event.payload as Record<string, unknown>);
+      },
+    });
+    const child = trace.start("adapter.execute", {
+      attributes: {
+        "paperclip.task.run.company_id": "018f4d2a-7c91-7abc-8def-0123456789ff",
+        "paperclip.task.run.task_id": "spoofed-task",
+        "paperclip.task.run.run_id": "spoofed-run",
+      },
+    });
+    trace.annotate(child, {
+      "paperclip.task.run.company_id": "018f4d2a-7c91-7abc-8def-0123456789ee",
+      "paperclip.task.run.task_id": "annotated-task",
+      "paperclip.task.run.run_id": "annotated-run",
+    });
+    await trace.end(child);
+    await trace.finish("ok");
+
+    const hash = (value: string) =>
+      createHash("sha256").update(value).digest("hex").slice(0, 12);
+    const trustedIdentity = {
+      "paperclip.task.run.company_id": companyId,
+      "paperclip.task.run.task_id": hash(taskId),
+      "paperclip.task.run.run_id": hash(runId),
+    };
+    for (const span of spans) {
+      expect(span.attributes).toMatchObject(trustedIdentity);
+    }
+    expect(events.find(event => event.span === "adapter.execute"))
+      .toMatchObject(trustedIdentity);
+  });
+
   it("creates a foldable canonical hierarchy with real parent contexts", async () => {
     const events: AdapterRuntimeEvent[] = [];
     const { traceContext, spans } = createRecordingTraceContext();

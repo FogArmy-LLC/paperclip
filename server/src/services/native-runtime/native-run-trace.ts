@@ -231,6 +231,17 @@ export function createNativeRunTrace(input: {
     ...(taskIdHash ? { "paperclip.task.run.task_id": taskIdHash } : {}),
     "paperclip.task.run.run_id": runIdHash,
   };
+  const traceIdentityKeys = new Set(Object.keys(traceIdentityAttributes));
+  const withTraceIdentity = (
+    attributes: Record<string, string | number | boolean> | undefined,
+  ): Record<string, string | number | boolean> => {
+    const safeNonIdentity = Object.fromEntries(
+      Object.entries(safeAttributes(attributes))
+        .filter(([key]) => !traceIdentityKeys.has(key))
+        .slice(0, Math.max(0, 16 - traceIdentityKeys.size)),
+    );
+    return { ...safeNonIdentity, ...traceIdentityAttributes };
+  };
   let rootSpan: SpanHandle;
   try {
     const owned = getRunExecutionTraceContext(input.runId);
@@ -349,10 +360,7 @@ export function createNativeRunTrace(input: {
     } = {},
   ): NativeRunSpanScope => {
     const startedAtMs = finiteMs(options.startedAtMs ?? Date.now());
-    const attributes = safeAttributes({
-      ...traceIdentityAttributes,
-      ...options.attributes,
-    });
+    const attributes = withTraceIdentity(options.attributes);
     const parent = parentFor(options.parentName);
     let span: SpanHandle;
     try {
@@ -404,14 +412,17 @@ export function createNativeRunTrace(input: {
     attributes: Record<string, string | number | boolean>,
   ): void => {
     const state = scopeState(scope);
-    const incoming = safeAttributes(attributes);
-    const retained = Object.fromEntries(
-      Object.entries(state.attributes).slice(
-        0,
-        Math.max(0, 16 - Object.keys(incoming).length),
-      ),
+    const incoming = Object.fromEntries(
+      Object.entries(safeAttributes(attributes))
+        .filter(([key]) => !traceIdentityKeys.has(key))
+        .slice(0, Math.max(0, 16 - traceIdentityKeys.size)),
     );
-    const safe = { ...retained, ...incoming };
+    const retained = Object.fromEntries(
+      Object.entries(state.attributes)
+        .filter(([key]) => !traceIdentityKeys.has(key))
+        .slice(0, Math.max(0, 16 - traceIdentityKeys.size - Object.keys(incoming).length)),
+    );
+    const safe = { ...retained, ...incoming, ...traceIdentityAttributes };
     state.attributes = safe;
     setOtelAttributes(state.span, safe);
   };
