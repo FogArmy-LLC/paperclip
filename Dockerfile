@@ -140,6 +140,12 @@ RUN find packages/paperclip-runner/runner packages/paperclip-runner/protocol -ty
 ARG PAPERCLIP_BUILD_COMMIT=""
 RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/plugin-sdk build
+RUN pnpm --filter @paperclipai/plugin-llm-wiki build \
+  && test -f packages/plugins/plugin-llm-wiki/dist/manifest.js \
+  && test -f packages/plugins/plugin-llm-wiki/dist/worker.js \
+  && test -f packages/plugins/plugin-llm-wiki/dist/ui/index.js \
+  && test -d packages/plugins/plugin-llm-wiki/skills \
+  || (echo "ERROR: plugin-llm-wiki build output missing" && exit 1)
 # The server build runs scripts/write-build-stamp.mjs, which stamps the built
 # commit into dist/build-info.json. The build context has no .git, so the
 # script reads PAPERCLIP_BUILD_COMMIT instead. Docker exposes an ARG to the
@@ -197,6 +203,16 @@ COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 COPY --chown=node:node --from=build /app /app
+COPY --chown=node:node --from=build /app/packages/plugins/plugin-llm-wiki/dist /app/packages/plugins/plugin-llm-wiki/dist
+COPY --chown=node:node --from=build /app/packages/plugins/plugin-llm-wiki/skills /app/packages/plugins/plugin-llm-wiki/skills
+RUN test -f /app/packages/plugins/plugin-llm-wiki/dist/manifest.js \
+  && test -f /app/packages/plugins/plugin-llm-wiki/dist/worker.js \
+  && test -f /app/packages/plugins/plugin-llm-wiki/dist/ui/index.js \
+  && test -d /app/packages/plugins/plugin-llm-wiki/skills \
+  && test -d /app/packages/plugins/plugin-llm-wiki/templates \
+  && test -d /app/packages/plugins/plugin-llm-wiki/agents \
+  && test -d /app/packages/plugins/plugin-llm-wiki/migrations \
+  || (echo "ERROR: runtime plugin-llm-wiki bundle missing" && exit 1)
 
 COPY --chown=0:0 --from=runner-provider-pack /provider-pack /opt/paperclip-runner/provider-pack
 COPY --from=runner-provider-pack /provider-pack-transport/ /opt/paperclip-runner/
