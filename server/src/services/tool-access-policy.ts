@@ -1525,13 +1525,106 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
       return decision("deny", "deny_policy_block", "Tool invocation no longer matches this admission.", [], []);
     }
     if (input.consumeRateLimit === true) consumedRateAdmissions.push(...(admittedRates ?? []));
-    const profileState = await effectiveProfiles(ctx, cache);
-    const effectiveProfileIds = profileState.profiles.map((profile) => profile.id);
-    const permittedByProfile = profileState.profiles.some((profile) => {
-      const matchingEntries = profileState.entries.filter((entry) => entry.profileId === profile.id && profileEntryMatches(entry, ctx));
-      return !matchingEntries.some((entry) => entry.effect === "exclude")
-        && (profile.defaultAction === "allow" || matchingEntries.some((entry) => entry.effect === "include"));
-    });
+    const isPaperclipSelfIssueUpdate =
+      ctx.providerType === "paperclip_self"
+      && ctx.toolName === "paperclip-self:update_issue"
+      && Boolean(ctx.agentId);
+    const isPaperclipRunnerNativeProfile = (profile: typeof toolProfiles.$inferSelect) =>
+      profile.profileKey.startsWith("native:")
+      || (isRecord(profile.metadata) && profile.metadata.source === "paperclip_runner");
+    const profilePermitsToolContext = (
+      profile: Pick<typeof toolProfiles.$inferSelect, "defaultAction">,
+      entries: Array<typeof toolProfileEntries.$inferSelect>,
+      targetCtx: ToolAccessContext,
+    ): boolean => {
+      const matchingEntries = entries.filter((entry) => profileEntryMatches(entry, targetCtx));
+      if (matchingEntries.some((entry) => entry.effect === "exclude")) return false;
+      if (profile.defaultAction === "allow" || matchingEntries.some((entry) => entry.effect === "include")) {
+        return true;
+      }
+      if (
+        targetCtx.providerType === "paperclip_self"
+        && targetCtx.toolName === "paperclip-self:update_issue"
+        && Boolean(targetCtx.agentId)
+      ) {
+        const issueContextPeer: ToolAccessContext = {
+          ...targetCtx,
+          toolName: "paperclip-self:get_issue_context",
+          upstreamToolName: "paperclip-self:get_issue_context",
+          riskLevel: "read",
+        };
+        const peerEntries = entries.filter((entry) => profileEntryMatches(entry, issueContextPeer));
+        if (
+          !peerEntries.some((entry) => entry.effect === "exclude")
+          && peerEntries.some((entry) => entry.effect === "include")
+        ) {
+          return true;
+        }
+      }
+      return false;
+    };
+    const policyExplicitlyTargetsPaperclipSelfUpdate = (policy: typeof toolPolicies.$inferSelect): boolean => {
+      const selectors = isRecord(policy.selectors) ? policy.selectors : {};
+      const toolNames = [
+        ...(typeof selectors.toolName === "string" ? [selectors.toolName] : []),
+        ...listValues(selectors.toolNames),
+      ];
+      const providerTypes = [
+        ...(typeof selectors.providerType === "string" ? [selectors.providerType] : []),
+        ...listValues(selectors.providerTypes),
+      ];
+      if (toolNames.includes("paperclip-self:update_issue") || providerTypes.includes("paperclip_self")) {
+        return true;
+      }
+      const conditions = policyConditions(policy);
+      if (conditions?.trustBoundary && isRecord(conditions.trustBoundary)) {
+        const boundary = conditions.trustBoundary as Record<string, unknown>;
+        const boundaryProviders = [
+          ...(typeof boundary.providerType === "string" ? [boundary.providerType] : []),
+          ...listValues(boundary.providerTypes),
+        ];
+        if (boolCondition(boundary.paperclipSelfOnly) === true || boundaryProviders.includes("paperclip_self")) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const primaryProfileState = await effectiveProfiles(ctx, cache);
+    const fallbackSelfProfileState =
+      ctx.providerType === "paperclip_self"
+      && Boolean(ctx.agentId)
+      && Boolean(ctx.gatewayId)
+      && primaryProfileState.profiles.length > 0
+      && primaryProfileState.profiles.every(isPaperclipRunnerNativeProfile)
+        ? await effectiveProfiles({ ...ctx, gatewayId: null }, cache)
+        : null;
+    const combinedProfiles = fallbackSelfProfileState
+      ? [
+          ...primaryProfileState.profiles,
+          ...fallbackSelfProfileState.profiles.filter(
+            (candidate) => !primaryProfileState.profiles.some((existing) => existing.id === candidate.id),
+          ),
+        ]
+      : primaryProfileState.profiles;
+    const combinedEntries = fallbackSelfProfileState
+      ? [
+          ...primaryProfileState.entries,
+          ...fallbackSelfProfileState.entries.filter(
+            (candidate) => !primaryProfileState.entries.some((existing) => existing.id === candidate.id),
+          ),
+        ]
+      : primaryProfileState.entries;
+    const effectiveProfileIds = combinedProfiles.map((profile) => profile.id);
+    const entriesByProfile = new Map<string, Array<typeof toolProfileEntries.$inferSelect>>();
+    for (const entry of combinedEntries) {
+      const list = entriesByProfile.get(entry.profileId) ?? [];
+      list.push(entry);
+      entriesByProfile.set(entry.profileId, list);
+    }
+    const permittedByProfile = combinedProfiles.some((profile) =>
+      profilePermitsToolContext(profile, entriesByProfile.get(profile.id) ?? [], ctx),
+    );
     const policies = await cachedRead(cache, `enabled-policies:${ctx.companyId}`, async () =>
       db.select().from(toolPolicies).where(and(eq(toolPolicies.companyId, ctx.companyId), eq(toolPolicies.enabled, true))).orderBy(asc(toolPolicies.priority), asc(toolPolicies.createdAt)));
     for (const policy of policies) {
@@ -1638,6 +1731,7 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
         return decision("allow", "allow_trust_rule", policy.description ?? "Tool access allowed by trust rule.", effectiveProfileIds, [policy.id], { redactionPlan: redaction.redactionPlan, policyExplanation });
       }
       if (policy.policyType === "require_approval") {
+        if (isPaperclipSelfIssueUpdate && !policyExplicitlyTargetsPaperclipSelfUpdate(policy)) continue;
         // The connection's Ask first control restricts an existing action grant;
         // it must never grant access to agents outside that connection's profile.
         if (["app_gallery_finish", "connection_intent"].includes(String(policy.config?.source)) && !permittedByProfile) continue;
@@ -1654,19 +1748,8 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
       return decision("allow", "allow_explicit_grant", "Tool access allowed by explicit grant.", effectiveProfileIds, [], { redactionPlan: redaction.redactionPlan });
     }
 
-    const entriesByProfile = new Map<string, Array<typeof toolProfileEntries.$inferSelect>>();
-    for (const entry of profileState.entries) {
-      const list = entriesByProfile.get(entry.profileId) ?? [];
-      list.push(entry);
-      entriesByProfile.set(entry.profileId, list);
-    }
-    for (const profile of profileState.profiles) {
-      const entries = entriesByProfile.get(profile.id) ?? [];
-      const matchingEntries = entries.filter((entry) => profileEntryMatches(entry, ctx));
-      if (matchingEntries.some((entry) => entry.effect === "exclude")) continue;
-      if (profile.defaultAction === "allow" || matchingEntries.some((entry) => entry.effect === "include")) {
-        return decision("allow", "allow_profile", "Tool access allowed by effective profile.", effectiveProfileIds, [], { redactionPlan: redaction.redactionPlan });
-      }
+    if (permittedByProfile) {
+      return decision("allow", "allow_profile", "Tool access allowed by effective profile.", effectiveProfileIds, [], { redactionPlan: redaction.redactionPlan });
     }
 
     return decision("deny", "deny_default", "No effective tool profile, grant, or allow policy permits this call.", effectiveProfileIds, [], { redactionPlan: redaction.redactionPlan });

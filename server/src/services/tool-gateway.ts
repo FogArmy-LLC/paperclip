@@ -121,9 +121,12 @@ import {
   getConnectableAppDefinition,
   isGitHubConnectorProfileId,
   isGoogleWorkspaceConnectorProfileId,
+  isUuidLike,
+  normalizeIssueIdentifier,
   type GitHubConnectorProfileId,
   type GoogleWorkspaceConnectorProfileId,
 } from "@paperclipai/shared";
+import { issueService } from "./issues.js";
 import type {
   AgentToolDescriptor,
   PluginToolDispatcher,
@@ -1078,6 +1081,31 @@ const BUILTIN_TOOLS: ToolGatewayDescriptor[] = [
     pluginId: "paperclip-self",
     providerType: "paperclip_self",
     risk: "read",
+  },
+  {
+    name: "paperclip-self:update_issue",
+    displayName: "Update issue",
+    description:
+      "Update status, assignee, and/or post a markdown comment on an issue in the authenticated agent's company.",
+    parametersSchema: {
+      type: "object",
+      properties: {
+        issueId: { type: "string" },
+        status: {
+          type: "string",
+          enum: ["todo", "in_progress", "in_review", "done", "blocked"],
+        },
+        assigneeAgentId: {
+          type: ["string", "null"],
+        },
+        comment: { type: "string" },
+      },
+      required: ["issueId"],
+      additionalProperties: false,
+    },
+    pluginId: "paperclip-self",
+    providerType: "paperclip_self",
+    risk: "write",
   },
   {
     name: "mcp-stdio-fixture:increment_counter",
@@ -3428,13 +3456,26 @@ export function createToolGatewayService(
           "agent_context_required",
         );
       }
-      const issueId =
-        typeof params.issueId === "string" ? params.issueId : session.issueId;
-      if (!issueId) {
+      const rawIssueRef =
+        typeof params.issueId === "string" ? params.issueId.trim() : (session.issueId ?? "");
+      if (!rawIssueRef) {
         throw new ToolGatewayHttpError(
           400,
           "issueId is required when the session is not issue-scoped",
           "missing_issue_id",
+        );
+      }
+      const normalizedIdentifier = normalizeIssueIdentifier(rawIssueRef);
+      const issueLookupPredicate = normalizedIdentifier
+        ? eq(issues.identifier, normalizedIdentifier)
+        : isUuidLike(rawIssueRef)
+          ? eq(issues.id, rawIssueRef)
+          : null;
+      if (!issueLookupPredicate) {
+        throw new ToolGatewayHttpError(
+          404,
+          "Issue not found",
+          "issue_not_found",
         );
       }
       const [issue] = await db
@@ -3448,7 +3489,7 @@ export function createToolGatewayService(
         })
         .from(issues)
         .where(
-          and(eq(issues.companyId, session.companyId), eq(issues.id, issueId)),
+          and(eq(issues.companyId, session.companyId), issueLookupPredicate),
         )
         .limit(1);
       if (!issue) {
@@ -3480,6 +3521,241 @@ export function createToolGatewayService(
         content: JSON.stringify({ issue, planDocument: planDocument ?? null }),
         data: { issue, planDocument: planDocument ?? null },
       };
+    }
+
+    if (tool.name === "paperclip-self:update_issue") {
+      if (!session.agentId) {
+        throw new ToolGatewayHttpError(
+          403,
+          "Paperclip self tools require an agent-scoped gateway session",
+          "agent_context_required",
+        );
+      }
+      await assertAgentInCompany(session.companyId, session.agentId);
+
+      const rawIssueId =
+        typeof params.issueId === "string" ? params.issueId.trim() : "";
+      if (!rawIssueId) {
+        throw new ToolGatewayHttpError(
+          400,
+          "issueId is required",
+          "missing_issue_id",
+        );
+      }
+
+      const allowedStatuses = new Set([
+        "todo",
+        "in_progress",
+        "in_review",
+        "done",
+        "blocked",
+      ]);
+      let nextStatus:
+        | "todo"
+        | "in_progress"
+        | "in_review"
+        | "done"
+        | "blocked"
+        | undefined;
+      if (params.status !== undefined) {
+        if (
+          typeof params.status !== "string" ||
+          !allowedStatuses.has(params.status)
+        ) {
+          throw new ToolGatewayHttpError(
+            400,
+            "status must be one of todo, in_progress, in_review, done, blocked",
+            "invalid_parameters",
+          );
+        }
+        nextStatus = params.status as typeof nextStatus;
+      }
+
+      const hasAssigneePatch = Object.prototype.hasOwnProperty.call(
+        params,
+        "assigneeAgentId",
+      ) && params.assigneeAgentId !== undefined;
+      let nextAssigneeAgentId: string | null | undefined;
+      if (hasAssigneePatch) {
+        if (params.assigneeAgentId === null) {
+          nextAssigneeAgentId = null;
+        } else if (typeof params.assigneeAgentId === "string") {
+          const trimmedAgentId = params.assigneeAgentId.trim();
+          if (!trimmedAgentId || !isUuidLike(trimmedAgentId)) {
+            throw new ToolGatewayHttpError(
+              400,
+              "assigneeAgentId must be a valid agent UUID or null",
+              "invalid_parameters",
+            );
+          }
+          const [targetAgent] = await db
+            .select({
+              id: agents.id,
+              companyId: agents.companyId,
+            })
+            .from(agents)
+            .where(eq(agents.id, trimmedAgentId))
+            .limit(1);
+          if (!targetAgent) {
+            throw new ToolGatewayHttpError(
+              404,
+              "Assignee agent not found",
+              "agent_not_found",
+            );
+          }
+          if (targetAgent.companyId !== session.companyId) {
+            throw new ToolGatewayHttpError(
+              403,
+              "Assignee agent belongs to another company",
+              "company_boundary_violation",
+            );
+          }
+          nextAssigneeAgentId = targetAgent.id;
+        } else {
+          throw new ToolGatewayHttpError(
+            400,
+            "assigneeAgentId must be a string or null",
+            "invalid_parameters",
+          );
+        }
+      }
+
+      if (params.comment !== undefined && typeof params.comment !== "string") {
+        throw new ToolGatewayHttpError(
+          400,
+          "comment must be a string",
+          "invalid_parameters",
+        );
+      }
+      const commentBody =
+        typeof params.comment === "string" ? params.comment.trim() : "";
+
+      const normalizedIdentifier = normalizeIssueIdentifier(rawIssueId);
+      const issueLookupPredicate = normalizedIdentifier
+        ? eq(issues.identifier, normalizedIdentifier)
+        : isUuidLike(rawIssueId)
+          ? eq(issues.id, rawIssueId)
+          : null;
+      if (!issueLookupPredicate) {
+        throw new ToolGatewayHttpError(
+          404,
+          "Issue not found",
+          "issue_not_found",
+        );
+      }
+
+      const [existingIssue] = await db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          identifier: issues.identifier,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+        })
+        .from(issues)
+        .where(issueLookupPredicate)
+        .orderBy(
+          sql`case when ${issues.companyId} = ${session.companyId} then 0 else 1 end`,
+        )
+        .limit(1);
+
+      if (!existingIssue) {
+        throw new ToolGatewayHttpError(
+          404,
+          "Issue not found",
+          "issue_not_found",
+        );
+      }
+      if (existingIssue.companyId !== session.companyId) {
+        throw new ToolGatewayHttpError(
+          403,
+          "Issue belongs to another company",
+          "company_boundary_violation",
+        );
+      }
+
+      const svc = issueService(db);
+      let finalIssue: {
+        id: string;
+        identifier: string | null;
+        status: string;
+        assigneeAgentId: string | null;
+      } = existingIssue;
+
+      try {
+        if (nextStatus !== undefined || hasAssigneePatch) {
+          const updated = await svc.update(existingIssue.id, {
+            ...(nextStatus !== undefined ? { status: nextStatus } : {}),
+            ...(hasAssigneePatch
+              ? {
+                  assigneeAgentId: nextAssigneeAgentId ?? null,
+                  ...(nextAssigneeAgentId !== null && nextAssigneeAgentId !== undefined
+                    ? { assigneeUserId: null }
+                    : {}),
+                }
+              : {}),
+            actorAgentId: session.agentId,
+            actorRunId: session.runId ?? null,
+            companyGuard: session.companyId,
+          });
+          if (!updated) {
+            throw new ToolGatewayHttpError(
+              404,
+              "Issue not found",
+              "issue_not_found",
+            );
+          }
+          finalIssue = {
+            id: updated.id,
+            identifier: updated.identifier,
+            status: updated.status,
+            assigneeAgentId: updated.assigneeAgentId ?? null,
+          };
+        }
+
+        let commentId: string | null = null;
+        if (commentBody.length > 0) {
+          const createdComment = await svc.addComment(
+            existingIssue.id,
+            commentBody,
+            {
+              agentId: session.agentId,
+              runId: session.runId ?? undefined,
+            },
+          );
+          commentId = createdComment.id;
+        }
+
+        const payload = {
+          ok: true,
+          issueId: finalIssue.id,
+          identifier: finalIssue.identifier,
+          status: finalIssue.status,
+          assigneeAgentId: finalIssue.assigneeAgentId ?? null,
+          commentId,
+        };
+        return {
+          content: JSON.stringify(payload),
+          data: payload,
+        };
+      } catch (err) {
+        if (err instanceof ToolGatewayHttpError) throw err;
+        if (err instanceof HttpError) {
+          throw new ToolGatewayHttpError(
+            err.status,
+            err.message,
+            err.status === 403
+              ? "company_boundary_violation"
+              : err.status === 404
+                ? "issue_not_found"
+                : "issue_update_failed",
+            err.details && typeof err.details === "object" && !Array.isArray(err.details)
+              ? (err.details as Record<string, unknown>)
+              : undefined,
+          );
+        }
+        throw err;
+      }
     }
 
     if (tool.providerType === "mcp_stdio_fixture") {
@@ -11311,7 +11587,9 @@ export function createToolGatewayService(
                 err.status,
                 err.message,
                 err.reasonCode,
-                err.details,
+                err.details && typeof err.details === "object" && !Array.isArray(err.details)
+              ? (err.details as Record<string, unknown>)
+              : undefined,
               )
             : err;
         const status =
@@ -11869,7 +12147,9 @@ export function createToolGatewayService(
             err.status,
             err.message,
             err.reasonCode,
-            err.details,
+            err.details && typeof err.details === "object" && !Array.isArray(err.details)
+              ? (err.details as Record<string, unknown>)
+              : undefined,
           );
         }
         throw err;
@@ -11899,7 +12179,9 @@ export function createToolGatewayService(
             err.status,
             err.message,
             err.reasonCode,
-            err.details,
+            err.details && typeof err.details === "object" && !Array.isArray(err.details)
+              ? (err.details as Record<string, unknown>)
+              : undefined,
           );
         }
         throw err;
