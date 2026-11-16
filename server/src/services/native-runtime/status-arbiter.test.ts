@@ -288,7 +288,7 @@ describe("native status authority", () => {
           rejectedEvidence: [
             {
               ref: "evidence:rejected-1",
-              reason: "Evidence verification failed hash validation",
+              reasonCode: "Evidence verification failed hash validation",
             },
           ],
         }),
@@ -308,7 +308,7 @@ describe("native status authority", () => {
           rejectedEvidence: [
             {
               ref: "evidence:rejected-2",
-              reason: "Evidence payload malformed",
+              reasonCode: "Evidence payload malformed",
             },
           ],
         }),
@@ -347,7 +347,7 @@ describe("native status authority", () => {
           rejectedEvidence: [
             {
               ref: "evidence:rejected-claim",
-              reason: "Claimed evidence rejected",
+              reasonCode: "Claimed evidence rejected",
             },
           ],
         }),

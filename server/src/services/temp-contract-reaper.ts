@@ -1,6 +1,7 @@
-import { and, eq, inArray, isNull, ne } from "drizzle-orm";
+import { and, eq, inArray, ne } from "drizzle-orm";
 import { agents, companies, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { createAgentLifecycle } from "./agent-lifecycle.js";
+import type { BudgetServiceHooks } from "./budgets.js";
 import { logActivity } from "./activity-log.js";
 
 const ACTIVE_RUN_STATUSES = ["queued", "claimed", "running"] as const;
@@ -93,11 +94,11 @@ export function tempContractReaperService(
       agentIds: string[],
       reason: string,
     ) => Promise<{ agentIds: string[]; runsCancelled: number; wakeupsCancelled: number }>;
-    cancelWorkForScope?: (scope: { companyId: string; agentId?: string }) => Promise<void>;
+    cancelWorkForScope?: BudgetServiceHooks["cancelWorkForScope"];
   } = {},
 ) {
   const lifecycle = createAgentLifecycle(db, {
-    cancelWorkForScope: deps.cancelWorkForScope ?? (async () => {}),
+    cancelWorkForScope: deps.cancelWorkForScope,
   });
 
   async function reapExpiredTempContracts(options: {
@@ -106,8 +107,8 @@ export function tempContractReaperService(
   } = {}): Promise<{ checked: number; reaped: number; items: TempContractReapItem[] }> {
     const now = options.now ?? new Date();
     const companyFilter = options.companyId
-      ? and(isNull(companies.archivedAt), eq(companies.id, options.companyId))
-      : isNull(companies.archivedAt);
+      ? and(ne(companies.status, "archived"), eq(companies.id, options.companyId))
+      : ne(companies.status, "archived");
 
     const rows = await db
       .select({
