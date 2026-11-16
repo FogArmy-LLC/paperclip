@@ -14,6 +14,7 @@ import { resolveNewAgentRunnerForCompany } from "../services/agent-runner-select
 import { agentEnvironmentTestService } from "../services/agent-environment-test.js";
 import { qualifyAgentRunner } from "../services/agent-runner-qualification.js";
 import { createAgentLifecycle } from "../services/agent-lifecycle.js";
+import { readTempContractLease, tempContractReaperService } from "../services/temp-contract-reaper.js";
 import { isAgentSetupDraft } from "../modules/agent-lifecycle/index.js";
 
 import { agentIdentityService } from "../services/agent-identity.js";
@@ -599,6 +600,10 @@ export function agentRoutes(
   const managementGuard = connectionManagementGuard(db, "ai");
   const svc = agentService(db, { cancelWorkForScope: scope => heartbeat.cancelBudgetScopeWork(scope) });
   const svcLifecycle = createAgentLifecycle(db, { cancelWorkForScope: scope => heartbeat.cancelBudgetScopeWork(scope) });
+  const tempContractReaper = tempContractReaperService(db, {
+    cancelInvocationsForAgents: (ids, reason) => heartbeat.cancelInvocationsForAgents(ids, reason),
+    cancelWorkForScope: scope => heartbeat.cancelBudgetScopeWork(scope),
+  });
   const access = accessService(db);
   const approvalsSvc = approvalService(db);
   const budgets = budgetService(db);
@@ -2600,6 +2605,157 @@ export function agentRoutes(
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
+  async function normalizeAndAuthorizeTempContractInput(
+    req: Request,
+    callerAgent: Awaited<ReturnType<typeof svc.getById>> | null,
+    input: Record<string, unknown>,
+  ): Promise<boolean> {
+    const lease = readTempContractLease(input.runtimeConfig);
+    if (!lease) return false;
+
+    if (req.actor.type === "agent") {
+      if (!callerAgent) {
+        throw forbidden("Hiring agent identity is required for temporary contractor leases");
+      }
+      if (callerAgent.reportsTo) {
+        const managerParent = await svc.getById(callerAgent.reportsTo);
+        if (managerParent && managerParent.reportsTo) {
+          throw forbidden(
+            "Only root executives and direct pod leads (org depth <= 2) may hire temporary contractors",
+          );
+        }
+      }
+      const requestedReportsTo =
+        typeof input.reportsTo === "string" && input.reportsTo.trim().length > 0
+          ? input.reportsTo.trim()
+          : callerAgent.id;
+      if (requestedReportsTo !== callerAgent.id && requestedReportsTo !== callerAgent.reportsTo) {
+        throw forbidden(
+          "Temporary contractors hired by an agent must report horizontally to the hiring lead or its direct executive",
+        );
+      }
+      input.reportsTo = requestedReportsTo;
+    }
+
+    const existingPerms = asRecord(input.permissions) ?? {};
+    input.permissions = {
+      ...existingPerms,
+      canCreateAgents: false,
+    };
+
+    const nowMs = Date.now();
+    const leasedAt =
+      lease.leasedAt && Number.isFinite(Date.parse(lease.leasedAt))
+        ? lease.leasedAt
+        : new Date(nowMs).toISOString();
+    const ttlMinutes = lease.ttlMinutes ?? 120;
+    const maxIdleMinutes = lease.maxIdleMinutes ?? 30;
+    const expiresAt =
+      lease.expiresAt && Number.isFinite(Date.parse(lease.expiresAt))
+        ? lease.expiresAt
+        : new Date(Date.parse(leasedAt) + ttlMinutes * 60_000).toISOString();
+
+    const rc = asRecord(input.runtimeConfig) ?? {};
+    input.runtimeConfig = {
+      ...rc,
+      contractLease: {
+        kind: "temp",
+        reason: lease.reason,
+        hiredByAgentId:
+          req.actor.type === "agent" && callerAgent ? callerAgent.id : lease.hiredByAgentId,
+        boundIssueId: lease.boundIssueId,
+        ttlMinutes,
+        maxIdleMinutes,
+        leasedAt,
+        expiresAt,
+      },
+    };
+    return true;
+  }
+
+  async function assertBoardOrAuthoritativeTempContractManager(
+    req: Request,
+    targetAgent: {
+      id: string;
+      companyId: string;
+      reportsTo: string | null;
+      runtimeConfig: unknown;
+    },
+    actionLabel: string,
+  ) {
+    if (req.actor.type !== "agent") {
+      assertBoard(req);
+      return {
+        actorType: "user" as const,
+        actorId: req.actor.userId ?? "board",
+        agentId: undefined,
+        runId: undefined,
+        agentApiKeyId: undefined,
+      };
+    }
+
+    const lease = readTempContractLease(targetAgent.runtimeConfig);
+    if (!lease) {
+      throw forbidden(`Board access required: agents cannot ${actionLabel} permanent core seats`);
+    }
+
+    const caller = req.actor.agentId ? await svc.getById(req.actor.agentId) : null;
+    if (!caller || caller.companyId !== targetAgent.companyId || caller.status === "terminated") {
+      throw forbidden("Caller agent is unavailable or belongs to another company");
+    }
+    if (caller.id === targetAgent.id) {
+      throw forbidden(`Temporary contractors cannot ${actionLabel} themselves`);
+    }
+
+    const isCeo = caller.role === "ceo";
+    const isAuthoritativeHiringManager =
+      Boolean(caller.permissions?.canCreateAgents) &&
+      (targetAgent.reportsTo === caller.id || lease.hiredByAgentId === caller.id);
+
+    if (!isCeo && !isAuthoritativeHiringManager) {
+      throw forbidden(`Caller agent is not authorized to ${actionLabel} this temporary contractor`);
+    }
+
+    return getActorInfo(req);
+  }
+
+  async function assertBoardOrAuthoritativeErrorRecoveryManager(
+    req: Request,
+    targetAgent: {
+      id: string;
+      companyId: string;
+      reportsTo: string | null;
+      runtimeConfig: unknown;
+    },
+  ) {
+    if (req.actor.type !== "agent") {
+      assertBoard(req);
+      return {
+        actorType: "user" as const,
+        actorId: req.actor.userId ?? "board",
+        agentId: undefined,
+        runId: undefined,
+        agentApiKeyId: undefined,
+      };
+    }
+
+    const caller = req.actor.agentId ? await svc.getById(req.actor.agentId) : null;
+    if (!caller || caller.companyId !== targetAgent.companyId || caller.status === "terminated") {
+      throw forbidden("Caller agent is unavailable or belongs to another company");
+    }
+
+    const lease = readTempContractLease(targetAgent.runtimeConfig);
+    const authorized =
+      caller.role === "ceo" ||
+      targetAgent.reportsTo === caller.id ||
+      lease?.hiredByAgentId === caller.id;
+    if (!authorized) {
+      throw forbidden("Only board users, CEO, or the seat's direct manager may clear agent error state");
+    }
+
+    return getActorInfo(req);
+  }
+
   function assertNoAgentInstructionsConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown> | null | undefined,
@@ -4408,7 +4564,7 @@ export function agentRoutes(
 
   const handleAgentHire = async (req: Request, res: Response) => {
     const companyId = req.params.companyId as string;
-    await assertCanCreateAgentsForCompany(req, companyId);
+    const hiringCallerAgent = await assertCanCreateAgentsForCompany(req, companyId);
     const sourceIssueIds = parseSourceIssueIds(req.body);
     const {
       desiredSkills: requestedDesiredSkills,
@@ -4431,6 +4587,8 @@ export function agentRoutes(
       runner: hireRunner,
       ...hireInput
     } = req.body;
+
+    await normalizeAndAuthorizeTempContractInput(req, hiringCallerAgent, hireInput);
 
     if (setupAgentId) {
       assertBoard(req);
@@ -4792,7 +4950,7 @@ export function agentRoutes(
 
   router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
-    await assertCanCreateAgentsForCompany(req, companyId);
+    const creatingCallerAgent = await assertCanCreateAgentsForCompany(req, companyId);
 
     const company = await db
       .select()
@@ -4807,7 +4965,8 @@ export function agentRoutes(
       assertBoard(req);
       if (!req.actor.userId) throw forbidden("User identity required for agent setup");
     }
-    if (company.requireBoardApprovalForNewAgents && !req.body.setupId) {
+    const isRequestedTempContract = readTempContractLease(req.body.runtimeConfig) !== null;
+    if (company.requireBoardApprovalForNewAgents && !req.body.setupId && !isRequestedTempContract) {
       throw conflict(
         "Direct agent creation requires board approval. Use POST /api/companies/:companyId/agent-hires to create a pending hire approval.",
       );
@@ -4830,6 +4989,7 @@ export function agentRoutes(
       runner: createRunner,
       ...createInput
     } = req.body;
+    await normalizeAndAuthorizeTempContractInput(req, creatingCallerAgent, createInput);
     const agentId = setupId ?? randomUUID();
     const requestedCreateConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, createInput.runtimeConfig);
@@ -5798,12 +5958,36 @@ export function agentRoutes(
     res.json(redactAgentRowForResponse(agent));
   });
 
+  router.post("/companies/:companyId/agents/reap-temp-contracts", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    if (req.actor.type === "agent") {
+      assertCompanyAccess(req, companyId);
+      const caller = req.actor.agentId ? await svc.getById(req.actor.agentId) : null;
+      if (!caller || caller.companyId !== companyId || caller.status === "terminated") {
+        throw forbidden("Caller agent is unavailable or belongs to another company");
+      }
+      if (caller.role !== "ceo" && !caller.permissions?.canCreateAgents) {
+        throw forbidden("Only board users, CEO, or hiring pod leads may reap expired temporary contracts");
+      }
+    } else {
+      assertBoard(req);
+      await assertBoardCanManageAgentsForCompany(req, companyId);
+    }
+
+    const result = await tempContractReaper.reapExpiredTempContracts({ companyId });
+    res.json(result);
+  });
+
   router.post("/agents/:id/pause", async (req, res) => {
-    assertBoard(req);
+    if (req.actor.type !== "agent") {
+      assertBoard(req);
+    }
     const id = req.params.id as string;
-    if (!(await getAccessibleAgent(req, res, id))) {
+    const existing = await getAccessibleAgent(req, res, id);
+    if (!existing) {
       return;
     }
+    const actor = await assertBoardOrAuthoritativeTempContractManager(req, existing, "pause");
     const agent = await svcLifecycle.pauseAgent(id);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
@@ -5814,8 +5998,11 @@ export function agentRoutes(
 
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "agent.paused",
       entityType: "agent",
       entityId: agent.id,
@@ -5860,12 +6047,15 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/clear-error", async (req, res) => {
-    assertBoard(req);
+    if (req.actor.type !== "agent") {
+      assertBoard(req);
+    }
     const id = req.params.id as string;
     const existing = await getAccessibleAgent(req, res, id);
     if (!existing) {
       return;
     }
+    const actor = await assertBoardOrAuthoritativeErrorRecoveryManager(req, existing);
     if (existing.orgChainHealth?.status === "invalid_org_chain") {
       res.status(409).json({
         error: existing.orgChainHealth?.repairGuidance ?? "Repair this agent's reporting chain before clearing its error",
@@ -5881,8 +6071,11 @@ export function agentRoutes(
 
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "agent.error_cleared",
       entityType: "agent",
       entityId: agent.id,
@@ -5892,18 +6085,21 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/approve", async (req, res) => {
-    assertBoard(req);
+    if (req.actor.type !== "agent") {
+      assertBoard(req);
+    }
     const id = req.params.id as string;
     const existing = await getAccessibleAgent(req, res, id);
     if (!existing) {
       return;
     }
+    const actor = await assertBoardOrAuthoritativeTempContractManager(req, existing, "approve");
     if (existing.status !== "pending_approval") {
       res.status(409).json({ error: "Only pending approval agents can be approved" });
       return;
     }
 
-    const decision = await approvalsSvc.approveHire(id, req.actor.userId ?? "board");
+    const decision = await approvalsSvc.approveHire(id, actor.actorId);
     const agent = decision?.agent;
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
@@ -5916,8 +6112,11 @@ export function agentRoutes(
 
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "agent.approved",
       entityType: "agent",
       entityId: agent.id,
@@ -5928,15 +6127,18 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/terminate", async (req, res) => {
-    assertBoard(req);
+    if (req.actor.type !== "agent") {
+      assertBoard(req);
+    }
     const id = req.params.id as string;
     const existing = await getAccessibleAgent(req, res, id);
     if (!existing) {
       return;
     }
+    const actor = await assertBoardOrAuthoritativeTempContractManager(req, existing, "terminate");
 
     const agent = existing.status === "pending_approval"
-      ? (await approvalsSvc.rejectHire(id, req.actor.userId ?? "board"))?.agent
+      ? (await approvalsSvc.rejectHire(id, actor.actorId))?.agent
       : await svcLifecycle.terminateAgent(id);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
@@ -5961,12 +6163,18 @@ export function agentRoutes(
 
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "agent.terminated",
       entityType: "agent",
       entityId: agent.id,
       details: {
+        ...(readTempContractLease(existing.runtimeConfig)
+          ? { tempContractReleased: true, contractLease: readTempContractLease(existing.runtimeConfig) }
+          : {}),
         invalidOrgChain: {
           descendantCount: invalidOrgChainDescendantIds.length,
           descendantIds: invalidOrgChainDescendantIds,

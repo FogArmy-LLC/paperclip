@@ -69,8 +69,22 @@ export const createAgentInstructionsBundleSchema = z.object({
   }),
 });
 
+export const agentContractLeaseSchema = z.object({
+  kind: z.enum(["core", "temp"]),
+  reason: z.enum(["sla_surge", "provider_failover"]).optional(),
+  hiredByAgentId: z.string().guid().nullable().optional(),
+  boundIssueId: z.string().guid().nullable().optional(),
+  ttlMinutes: z.number().int().min(1).max(1440).optional(),
+  maxIdleMinutes: z.number().int().min(1).max(1440).optional(),
+  leasedAt: z.string().datetime().optional(),
+  expiresAt: z.string().datetime().optional(),
+}).strict();
+
+export type AgentContractLease = z.infer<typeof agentContractLeaseSchema>;
+
 export const agentRuntimeConfigSchema = z.object({
   aiConnection: aiConnectionBindingSchema.optional(),
+  contractLease: agentContractLeaseSchema.optional(),
   debug: z.object({
     providerTrace: z.literal("raw").optional(),
   }).strict().optional(),

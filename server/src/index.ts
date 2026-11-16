@@ -1,6 +1,7 @@
 import { registerNativeCancellationDelivery } from "./services/native-runtime/native-cancellation-delivery.js";
 import { registerNativeRuntimeResponseDelivery } from "./services/native-runtime/native-runtime-response-delivery.js";
 import { attentionRetentionService, registerAttentionRetentionWork } from "./services/attention-retention.js";
+import { tempContractReaperService } from "./services/temp-contract-reaper.js";
 import { registerRoutineExecutionStatusWork } from "./services/routine-execution-status-work.js";
 import { routineExecutionStatusService } from "./services/routine-run-status.js";
 import { registerMergeConfirmationWork } from "./services/merged-pr-confirmation-work.js";
@@ -1803,12 +1804,20 @@ async function startServerWithDatabaseTeardown(
           () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped);
         trackHeartbeatSchedulerWork(status.ready);
       }
+      const tempContractReaper = tempContractReaperService(db as any, {
+        cancelInvocationsForAgents: (ids, reason) => heartbeat.cancelInvocationsForAgents(ids, reason),
+        cancelWorkForScope: scope => heartbeat.cancelBudgetScopeWork(scope),
+      });
       const scheduled = registerScheduledWork(deliveryWork, {
         retryMs: config.heartbeatSchedulerIntervalMs,
         tickAgentTimers: async signal => {
           const result = await heartbeat.tickAgentTimers(new Date(),
             () => !signal.aborted && readTaskDrain(new Date()) === null && !isWarmStandby() && !heartbeatSchedulerStopped);
           if (result.enqueued > 0) logger.info({ ...result }, "heartbeat timer tick enqueued runs");
+          if (!signal.aborted && readTaskDrain(new Date()) === null && !isWarmStandby() && !heartbeatSchedulerStopped) {
+            const reaped = await tempContractReaper.reapExpiredTempContracts({ now: new Date() }).catch(() => ({ checked: 0, reaped: 0, items: [] }));
+            if (reaped.reaped > 0) logger.info({ ...reaped }, "temp contract reaper terminated expired leases");
+          }
         },
         canRun: () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped,
         nextAgentTimerAt: () => heartbeat.nextAgentTimerAt(),
